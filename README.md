@@ -6,6 +6,8 @@
 
 Argus Capture is an camera tethering application that uses voice-to-text AI to control the camera and the shooting.
 
+Argus Capture is named after [Argus](https://en.wikipedia.org/wiki/Argus_Panoptes) which is a many-eyed giant in Greek mythology.
+
 ## Features
 
 
