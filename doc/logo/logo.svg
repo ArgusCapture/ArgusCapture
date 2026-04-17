@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="500" viewBox="-125 -145 250 250">
+<title>Brain iris lens logo — variant_2</title>
+<desc>Cerebral cortex with bulging lobes, brown iris eye lens, no flare</desc>
+<defs>
+  <clipPath id="CL"><path d="M0,-78 C-20,-90 -58,-86 -86,-66 C-112,-48 -116,-16 -112,16 C-109,40 -93,60 -68,63 L0,63 Z"/></clipPath>
+  <clipPath id="CR"><path d="M0,-78 C20,-90 58,-86 86,-66 C112,-48 116,-16 112,16 C109,40 93,60 68,63 L0,63 Z"/></clipPath>
+</defs>
+
+<path d="M0,-78 C-20,-90 -58,-86 -86,-66 C-112,-48 -116,-16 -112,16 C-109,40 -93,60 -68,63 L68,63 C93,60 109,40 112,16 C116,-16 112,-48 86,-66 C58,-86 20,-90 0,-78 Z" fill="#c8b4a4"/>
+
+<g clip-path="url(#CL)" fill="none" stroke-linecap="round">
+  <path d="M-6,-76 C-18,-58 -2,-40 -8,-16 C-12,4 2,24 -4,48 C-8,60 -4,63 -6,63" stroke="#ddd0be" stroke-width="5.5"/>
+  <path d="M-12,-75 C-24,-57 -8,-39 -14,-15 C-18,5 -4,25 -10,49 C-14,61 -10,63 -12,63" stroke="#7a5840" stroke-width="1.3"/>
+  <path d="M-24,-72 C-38,-52 -18,-30 -28,-6 C-36,16 -16,36 -24,58 C-28,63 -24,63 -26,63" stroke="#ddd0be" stroke-width="5.2"/>
+  <path d="M-32,-70 C-46,-50 -26,-28 -36,-4 C-44,18 -24,38 -32,60" stroke="#7a5840" stroke-width="1.2"/>
+  <path d="M-44,-66 C-62,-44 -36,-18 -52,8 C-64,28 -40,50 -54,62" stroke="#ddd0be" stroke-width="5"/>
+  <path d="M-52,-62 C-70,-40 -44,-14 -60,12 C-72,32 -48,54 -62,62" stroke="#7a5840" stroke-width="1.2"/>
+  <path d="M-64,-54 C-80,-32 -56,-8 -70,18 C-80,36 -60,54 -72,61" stroke="#ddd0be" stroke-width="4.5"/>
+  <path d="M-72,-47 C-87,-26 -64,-3 -77,22 C-86,39 -68,55 -79,61" stroke="#7a5840" stroke-width="1.1"/>
+  <path d="M-82,-37 C-96,-17 -74,4 -86,28 C-94,43 -78,54 -87,58" stroke="#ddd0be" stroke-width="3.5"/>
+  <path d="M-90,-28 C-103,-10 -82,9 -93,31 C-100,44 -86,52 -94,55" stroke="#7a5840" stroke-width="1"/>
+  <path d="M-112,16 C-92,6 -78,18 -56,6 C-38,-4 -22,10 -8,4" stroke="#ddd0be" stroke-width="4"/>
+  <path d="M-112,28 C-92,18 -78,30 -56,18 C-38,8 -22,22 -8,16" stroke="#7a5840" stroke-width="1.1"/>
+  <path d="M-112,42 C-92,32 -78,44 -56,32 C-38,22 -22,36 -8,30" stroke="#ddd0be" stroke-width="3.2"/>
+  <path d="M-112,54 C-92,46 -78,56 -56,46 C-38,38 -22,50 -8,44" stroke="#7a5840" stroke-width="1"/>
+</g>
+
+<g clip-path="url(#CR)" fill="none" stroke-linecap="round">
+  <path d="M6,-76 C18,-58 2,-40 8,-16 C12,4 -2,24 4,48 C8,60 4,63 6,63" stroke="#ddd0be" stroke-width="5.5"/>
+  <path d="M12,-75 C24,-57 8,-39 14,-15 C18,5 4,25 10,49 C14,61 10,63 12,63" stroke="#7a5840" stroke-width="1.3"/>
+  <path d="M24,-72 C38,-52 18,-30 28,-6 C36,16 16,36 24,58 C28,63 24,63 26,63" stroke="#ddd0be" stroke-width="5.2"/>
+  <path d="M32,-70 C46,-50 26,-28 36,-4 C44,18 24,38 32,60" stroke="#7a5840" stroke-width="1.2"/>
+  <path d="M44,-66 C62,-44 36,-18 52,8 C64,28 40,50 54,62" stroke="#ddd0be" stroke-width="5"/>
+  <path d="M52,-62 C70,-40 44,-14 60,12 C72,32 48,54 62,62" stroke="#7a5840" stroke-width="1.2"/>
+  <path d="M64,-54 C80,-32 56,-8 70,18 C80,36 60,54 72,61" stroke="#ddd0be" stroke-width="4.5"/>
+  <path d="M72,-47 C87,-26 64,-3 77,22 C86,39 68,55 79,61" stroke="#7a5840" stroke-width="1.1"/>
+  <path d="M82,-37 C96,-17 74,4 86,28 C94,43 78,54 87,58" stroke="#ddd0be" stroke-width="3.5"/>
+  <path d="M90,-28 C103,-10 82,9 93,31 C100,44 86,52 94,55" stroke="#7a5840" stroke-width="1"/>
+  <path d="M112,16 C92,6 78,18 56,6 C38,-4 22,10 8,4" stroke="#ddd0be" stroke-width="4"/>
+  <path d="M112,28 C92,18 78,30 56,18 C38,8 22,22 8,16" stroke="#7a5840" stroke-width="1.1"/>
+  <path d="M112,42 C92,32 78,44 56,32 C38,22 22,36 8,30" stroke="#ddd0be" stroke-width="3.2"/>
+  <path d="M112,54 C92,46 78,56 56,46 C38,38 22,50 8,44" stroke="#7a5840" stroke-width="1"/>
+</g>
+
+<!-- Lens barrel -->
+<circle r="57" fill="#0d0b08"/>
+<circle r="54" fill="#060402" stroke="#222018" stroke-width="1.5"/>
+<circle r="51" fill="none" stroke="#181512" stroke-width="0.8"/>
+<circle r="49" fill="none" stroke="#100e0a" stroke-width="1.2"/>
+
+<!-- Iris base -->
+<circle r="47" fill="#523018"/>
+<!-- Limbal ring shadow -->
+<circle r="47" fill="none" stroke="#0f0704" stroke-width="7"/>
+
+<!-- Iris fibers dark layer -->
+<g fill="none" stroke="#1a0c06" stroke-width="1.1" stroke-linecap="round" opacity="0.76">
+  <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(0)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(10)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(20)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(30)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(40)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(50)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(60)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(70)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(80)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(90)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(100)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(110)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(120)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(130)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(140)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(150)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(160)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(170)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(180)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(190)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(200)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(210)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(220)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(230)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(240)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(250)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(260)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(270)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(280)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(290)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(300)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(310)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(320)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(330)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(340)"/>
+    <line x1="0" y1="-15" x2="0" y2="-44" transform="rotate(350)"/>
+</g>
+<!-- Iris fibers light layer -->
+<g fill="none" stroke="#7a5018" stroke-width="0.65" stroke-linecap="round" opacity="0.42">
+  <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(5)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(15)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(25)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(35)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(45)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(55)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(65)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(75)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(85)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(95)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(105)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(115)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(125)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(135)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(145)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(155)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(165)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(175)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(185)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(195)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(205)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(215)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(225)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(235)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(245)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(255)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(265)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(275)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(285)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(295)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(305)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(315)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(325)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(335)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(345)"/>
+    <line x1="0" y1="-16" x2="0" y2="-43" transform="rotate(355)"/>
+</g>
+
+<!-- Iris crypts (dark patches) -->
+<ellipse cx="28" cy="-20" rx="4" ry="2.2" transform="rotate(25,28,-20)" fill="#1a0c06" opacity="0.55"/>
+<ellipse cx="-34" cy="14" rx="3.5" ry="2" transform="rotate(-15,-34,14)" fill="#1a0c06" opacity="0.45"/>
+<ellipse cx="6" cy="38" rx="3.2" ry="1.8" transform="rotate(8,6,38)" fill="#1a0c06" opacity="0.38"/>
+
+<!-- Collarette ring -->
+<circle r="18" fill="#1a0c06" opacity="0.38"/>
+<circle r="22" fill="none" stroke="#362010" stroke-width="2.5" opacity="0.85"/>
+
+<!-- Pupil -->
+<circle r="13" fill="#070508"/>
+<circle r="10" fill="#030204"/>
+
+<!-- Brain outline -->
+<path d="M0,-78 C-20,-90 -58,-86 -86,-66 C-112,-48 -116,-16 -112,16 C-109,40 -93,60 -68,63 L68,63 C93,60 109,40 112,16 C116,-16 112,-48 86,-66 C58,-86 20,-90 0,-78 Z" fill="none" stroke="#2e1a0e" stroke-width="2"/>
+</svg>

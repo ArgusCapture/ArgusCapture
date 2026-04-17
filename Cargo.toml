@@ -1,0 +1,9 @@
+[package]
+name = "argus-capture"
+version = "0.1.0"
+edition = "2024"
+description = "Starter binary for camera capture workflows built on gphoto2"
+readme = "README.md"
+
+[dependencies]
+gphoto2 = "3.4.1"
