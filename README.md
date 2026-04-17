@@ -13,7 +13,7 @@ Argus Capture is named after [Argus](https://en.wikipedia.org/wiki/Argus_Panopte
 
 ## Compiling the source
 
-**pgmoneta** requires
+**Argus Capture** requires
 
 * [rust](https://rust-lang.org/)
 * [cargo](https://rust-lang.org/)
