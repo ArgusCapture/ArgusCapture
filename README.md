@@ -1,6 +1,8 @@
 # Argus Capture
 
-![Argus Capture logo](doc/logo/logo-256x256.png)
+<p align="center">
+  <img src="doc/logo/logo-256x256.png" alt="Argus Capture logo">
+</p>
 
 Argus Capture is an camera tethering application that uses voice-to-text AI to control the camera and the shooting.
 
