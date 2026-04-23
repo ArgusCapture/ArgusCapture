@@ -33,11 +33,31 @@ Don't forget to indicate your Argus Capture version.
 
 For Red Hat RPM based distributions use the following command:
 
-```
+```bash
 dnf install git rust rust-std-static cargo rustfmt clippy
 ```
+## Setup your build environment in Windows
+1. You can install Rust using [rustup](https://rust-lang.org/tools/install/)
+2. Install MSYS2 and add it to your PATH. You can download it from [MSYS2](https://www.msys2.org/).
+3. Open the MSYS2 Blue terminal (not yellow or purple) and install the necessary dependencies.
 
-in order to get the necessary dependencies.
+```bash
+pacman -S mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libgphoto2 mingw-w64-x86_64-clang
+
+```
+
+4. Add the following environment variables to your system using the PowerShell.
+
+```shell
+$env:LIBCLANG_PATH = "C:\msys64\mingw64\bin"
+$env:PKG_CONFIG_PATH = "C:\msys64\mingw64\lib\pkgconfig"
+$env:PATH += ";C:\msys64\mingw64\bin"
+```
+
+5. Open a new terminal and run `cargo build` in the project directory to build the project.
+
+
+In order to get the necessary dependencies.
 
 ## Building the main branch
 
