@@ -1,3 +1,20 @@
+<!--
+Copyright (C) 2026 The Argus Capture community
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-->
+
 # Argus Capture
 
 <p align="center">
@@ -46,6 +63,35 @@ cd ArgusCapture
 cargo build
 cd target/debug
 ```
+
+List detected USB and ONVIF network cameras:
+
+```sh
+./argus-capture -l
+```
+
+Load configuration from an INI file:
+
+```sh
+./argus-capture --config ./doc/etc/argus-capture.conf -l
+```
+
+Create `~/.argus-capture/argus-capture.conf` interactively:
+
+```sh
+./argus-capture --init
+```
+
+This command creates `~/.argus-capture/argus-capture.conf`, prefills detected
+camera details as prompt defaults, and asks before overwriting an existing file.
+
+If `--config` is not provided, **Argus Capture** first looks for
+`~/.argus-capture/argus-capture.conf` and then
+`/etc/argus-capture/argus-capture.conf`.
+
+If neither file exists, **Argus Capture** runs without a loaded configuration.
+
+A sample configuration is available at `doc/etc/argus-capture.conf`.
 
 ## Contributing
 
