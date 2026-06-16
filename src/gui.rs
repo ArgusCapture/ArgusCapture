@@ -76,12 +76,7 @@ fn build_ui(application: &Application, configured_camera: Rc<RefCell<ConfiguredC
     application.set_accels_for_action("app.camera-disconnect", &["d"]);
     application.set_accels_for_action("app.help-about", &["a"]);
 
-    update_connection_state(
-        false,
-        &status_label,
-        &connect_action,
-        &disconnect_action,
-    );
+    update_connection_state(false, &status_label, &connect_action, &disconnect_action);
 
     {
         let application = application.clone();
@@ -311,9 +306,7 @@ fn present_configuration_dialog(
         }
 
         if username.is_some() != password.is_some() {
-            status_label.set_text(
-                "Configuration requires both username and password or neither.",
-            );
+            status_label.set_text("Configuration requires both username and password or neither.");
             return;
         }
 
@@ -382,10 +375,7 @@ fn present_about_dialog(parent: &ApplicationWindow) {
 }
 
 fn attach_form_row<W: IsA<gtk::Widget>>(grid: &Grid, row: i32, label: &str, widget: &W) {
-    let label = Label::builder()
-        .label(label)
-        .halign(Align::End)
-        .build();
+    let label = Label::builder().label(label).halign(Align::End).build();
     grid.attach(&label, 0, row, 1, 1);
     grid.attach(widget, 1, row, 1, 1);
 }
