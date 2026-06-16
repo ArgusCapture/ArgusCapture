@@ -14,3 +14,21 @@ make install
 ```
 
 if you have [llama.cpp](https://github.com/ggml-org/llama.cpp) installed. Otherwise remove the `-DWHISPER_USE_SYSTEM_GGML=ON` from the cmake command.
+
+## Getting a model
+
+```sh
+cd models
+./download-ggml-model.sh large-v3
+```
+
+## Running
+
+```sh
+whisper-server \
+  -m /path/to/ggml-large-v3.bin \
+  --host 0.0.0.0 \
+  --port 8080 \
+  -t 8 \
+  -l auto
+```
