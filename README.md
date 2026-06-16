@@ -64,6 +64,8 @@ cargo build
 cd target/debug
 ```
 
+Running `./argus-capture` without options launches the native GTK4 UI.
+
 List detected USB and ONVIF network cameras:
 
 ```sh

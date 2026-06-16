@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use gphoto2::Context;
 
 mod config;
+mod gui;
 mod init;
 mod network;
 
@@ -56,40 +57,14 @@ async fn main() -> AppResult<()> {
     let config = config::AppConfig::load(options.config_path.as_deref())?;
 
     match options.command {
-        Command::Capture => {}
+        Command::Capture => {
+            gui::run(config.as_ref());
+            Ok(())
+        }
         Command::Init => unreachable!("init is handled before config loading"),
         Command::Help => unreachable!("help is handled before config loading"),
-        Command::List => {
-            list_detected_cameras(config.as_ref()).await?;
-            return Ok(());
-        }
+        Command::List => list_detected_cameras(config.as_ref()).await,
     }
-
-    let context = Context::new()?;
-    let cameras: Vec<_> = context.list_cameras().wait()?.collect();
-
-    if cameras.is_empty() {
-        println!(
-            "No USB cameras detected. Connect a supported camera or run `argus-capture -l` \
-             to discover ONVIF cameras on the network."
-        );
-        return Ok(());
-    }
-
-    println!("Detected cameras:");
-    for camera in &cameras {
-        println!("- {} on {}", camera.model, camera.port);
-    }
-
-    let camera = context.get_camera(&cameras[0]).wait()?;
-    println!("Selected camera: {}", camera.abilities().model());
-
-    match camera.summary() {
-        Ok(summary) => println!("\nSummary:\n{summary}"),
-        Err(error) => eprintln!("Could not read camera summary: {error}"),
-    }
-
-    Ok(())
 }
 
 fn parse_args() -> io::Result<CliOptions> {
@@ -174,7 +149,7 @@ fn print_usage() {
 }
 
 fn usage() -> &'static str {
-    "Usage: argus-capture [OPTIONS]\n\nOptions:\n  -c, --config FILE   load INI configuration from FILE\n  -i, --init          create ~/.argus-capture/argus-capture.conf interactively\n  -l, --list          list detected USB and ONVIF network cameras\n  -h, --help          print help\n\nIf --config is not provided, argus-capture first looks for ~/.argus-capture/argus-capture.conf and then /etc/argus-capture/argus-capture.conf."
+    "Usage: argus-capture [OPTIONS]\n\nRunning without options launches the native GTK4 UI.\n\nOptions:\n  -c, --config FILE   load INI configuration from FILE\n  -i, --init          create ~/.argus-capture/argus-capture.conf interactively\n  -l, --list          list detected USB and ONVIF network cameras\n  -h, --help          print help\n\nIf --config is not provided, argus-capture first looks for ~/.argus-capture/argus-capture.conf and then /etc/argus-capture/argus-capture.conf."
 }
 
 #[cfg(test)]

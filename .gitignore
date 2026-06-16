@@ -16,3 +16,6 @@
 /target
 .vscode/
 .idea/
+/.cargo/
+/local-libs/
+/pkgconfig/
