@@ -16,18 +16,21 @@
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gtk::gio;
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, Dialog, Entry, Grid, Label,
-    Orientation, PopoverMenuBar, ResponseType, SpinButton,
+    Orientation, Picture, PopoverMenuBar, ResponseType, SpinButton,
 };
 
 use crate::config::{self, AppConfig, ConfiguredCamera};
 
 const APP_ID: &str = "org.arguscapture.ArgusCapture";
+const APP_NAME: &str = "Argus Capture";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) fn run(config: Option<&AppConfig>) {
     let application = Application::new(Some(APP_ID), gio::ApplicationFlags::empty());
@@ -59,16 +62,19 @@ fn build_ui(application: &Application, configured_camera: Rc<RefCell<ConfiguredC
     let connect_action = gio::SimpleAction::new("camera-connect", None);
     let disconnect_action = gio::SimpleAction::new("camera-disconnect", None);
     let configuration_action = gio::SimpleAction::new("edit-configuration", None);
+    let about_action = gio::SimpleAction::new("help-about", None);
     let quit_action = gio::SimpleAction::new("quit", None);
 
     application.add_action(&connect_action);
     application.add_action(&disconnect_action);
     application.add_action(&configuration_action);
+    application.add_action(&about_action);
     application.add_action(&quit_action);
 
     application.set_accels_for_action("app.quit", &["q"]);
     application.set_accels_for_action("app.camera-connect", &["c"]);
     application.set_accels_for_action("app.camera-disconnect", &["d"]);
+    application.set_accels_for_action("app.help-about", &["a"]);
 
     update_connection_state(
         false,
@@ -136,7 +142,14 @@ fn build_ui(application: &Application, configured_camera: Rc<RefCell<ConfiguredC
         });
     }
 
-    let menu_bar = build_menu_bar();
+    {
+        let window = window.clone();
+        about_action.connect_activate(move |_, _| {
+            present_about_dialog(&window);
+        });
+    }
+
+    let menu_bar = build_menu_bar_row();
     let toolbar = build_toolbar();
     let content = build_content_placeholder();
 
@@ -150,23 +163,41 @@ fn build_ui(application: &Application, configured_camera: Rc<RefCell<ConfiguredC
     window.present();
 }
 
-fn build_menu_bar() -> PopoverMenuBar {
-    let root = gio::Menu::new();
+fn build_menu_bar_row() -> GtkBox {
+    let left_root = gio::Menu::new();
 
     let file_menu = gio::Menu::new();
     file_menu.append(Some("Quit"), Some("app.quit"));
-    root.append_submenu(Some("File"), &file_menu);
+    left_root.append_submenu(Some("File"), &file_menu);
 
     let edit_menu = gio::Menu::new();
     edit_menu.append(Some("Configuration"), Some("app.edit-configuration"));
-    root.append_submenu(Some("Edit"), &edit_menu);
+    left_root.append_submenu(Some("Edit"), &edit_menu);
 
     let camera_menu = gio::Menu::new();
     camera_menu.append(Some("Connect"), Some("app.camera-connect"));
     camera_menu.append(Some("Disconnect"), Some("app.camera-disconnect"));
-    root.append_submenu(Some("Camera"), &camera_menu);
+    left_root.append_submenu(Some("Camera"), &camera_menu);
 
-    PopoverMenuBar::from_model(Some(&root))
+    let menu_row = GtkBox::new(Orientation::Horizontal, 0);
+    let left_menu_bar = PopoverMenuBar::from_model(Some(&left_root));
+    left_menu_bar.set_hexpand(false);
+
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+
+    let right_root = gio::Menu::new();
+    let help_menu = gio::Menu::new();
+    help_menu.append(Some("About"), Some("app.help-about"));
+    right_root.append_submenu(Some("Help"), &help_menu);
+
+    let right_menu_bar = PopoverMenuBar::from_model(Some(&right_root));
+    right_menu_bar.set_hexpand(false);
+
+    menu_row.append(&left_menu_bar);
+    menu_row.append(&spacer);
+    menu_row.append(&right_menu_bar);
+    menu_row
 }
 
 fn build_toolbar() -> GtkBox {
@@ -309,6 +340,47 @@ fn present_configuration_dialog(
     dialog.present();
 }
 
+fn present_about_dialog(parent: &ApplicationWindow) {
+    let dialog = Dialog::builder()
+        .title("About")
+        .transient_for(parent)
+        .modal(true)
+        .resizable(false)
+        .build();
+    dialog.add_button("Close", ResponseType::Close);
+
+    let content_area = dialog.content_area();
+    content_area.set_spacing(16);
+    content_area.set_margin_top(16);
+    content_area.set_margin_bottom(16);
+    content_area.set_margin_start(24);
+    content_area.set_margin_end(24);
+
+    let content = GtkBox::new(Orientation::Vertical, 12);
+    content.set_halign(Align::Center);
+    content.set_valign(Align::Center);
+
+    let logo = Picture::for_filename(logo_path());
+    logo.set_halign(Align::Center);
+
+    let name_label = Label::new(Some(APP_NAME));
+    name_label.set_halign(Align::Center);
+    name_label.add_css_class("title-2");
+
+    let version_label = Label::new(Some(APP_VERSION));
+    version_label.set_halign(Align::Center);
+
+    content.append(&logo);
+    content.append(&name_label);
+    content.append(&version_label);
+    content_area.append(&content);
+
+    dialog.connect_response(|dialog, _| {
+        dialog.close();
+    });
+    dialog.present();
+}
+
 fn attach_form_row<W: IsA<gtk::Widget>>(grid: &Grid, row: i32, label: &str, widget: &W) {
     let label = Label::builder()
         .label(label)
@@ -357,4 +429,8 @@ fn update_connection_state(
     });
     connect_action.set_enabled(!connected);
     disconnect_action.set_enabled(connected);
+}
+
+fn logo_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("doc/logo/logo-256x256.png")
 }
