@@ -24,6 +24,7 @@ dependencies = [
  "configparser",
  "digest_auth",
  "futures",
+ "gdk-pixbuf",
  "gphoto2",
  "gtk4",
  "if-addrs",
