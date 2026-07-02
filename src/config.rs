@@ -33,6 +33,8 @@ pub(crate) const DEFAULT_CONFIG_PATH: &str = "/etc/argus-capture/argus-capture.c
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct AppConfig {
     pub(crate) path: PathBuf,
+    workspace: PathBuf,
+    storage: StorageMode,
     selected_camera: ConfiguredCamera,
 }
 
@@ -56,6 +58,14 @@ impl AppConfig {
         &self.selected_camera
     }
 
+    pub(crate) fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub(crate) fn storage(&self) -> StorageMode {
+        self.storage
+    }
+
     fn from_path(path: &Path) -> io::Result<Self> {
         let mut ini = Ini::new();
         ini.load(path)
@@ -64,6 +74,21 @@ impl AppConfig {
     }
 
     fn from_ini(path: PathBuf, ini: Ini) -> io::Result<Self> {
+        let workspace = optional_value(&ini, "ArgusCapture", "workspace")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_workspace);
+        let storage = match optional_value(&ini, "ArgusCapture", "storage") {
+            Some(value) => StorageMode::parse(&value).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid storage mode `{value}` in {}: expected `camera_only`, `workspace_only`, or `both`",
+                        path.display()
+                    ),
+                )
+            })?,
+            None => default_storage(),
+        };
         let camera_name = required_value(&ini, "ArgusCapture", "camera")?;
         let host = required_value(&ini, &camera_name, "host")?;
         let port = required_value(&ini, &camera_name, "port")?
@@ -93,6 +118,8 @@ impl AppConfig {
 
         Ok(Self {
             path,
+            workspace,
+            storage,
             selected_camera: ConfiguredCamera {
                 name: camera_name,
                 host,
@@ -101,6 +128,32 @@ impl AppConfig {
                 password,
             },
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageMode {
+    CameraOnly,
+    WorkspaceOnly,
+    Both,
+}
+
+impl StorageMode {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "camera_only" => Some(Self::CameraOnly),
+            "workspace_only" => Some(Self::WorkspaceOnly),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_config_value(self) -> &'static str {
+        match self {
+            Self::CameraOnly => "camera_only",
+            Self::WorkspaceOnly => "workspace_only",
+            Self::Both => "both",
+        }
     }
 }
 
@@ -119,13 +172,21 @@ impl ConfiguredCamera {
     }
 }
 
-pub(crate) fn render_user_config(camera: &ConfiguredCamera) -> String {
+pub(crate) fn render_user_config(
+    workspace: &Path,
+    storage: StorageMode,
+    camera: &ConfiguredCamera,
+) -> String {
     let mut config = format!(
         "[ArgusCapture]\n\
+         workspace = {workspace}\n\
+         storage = {storage}\n\
          camera = {name}\n\n\
          [{name}]\n\
          host = {host}\n\
          port = {port}\n",
+        workspace = workspace.display(),
+        storage = storage.as_config_value(),
         name = camera.name,
         host = camera.host,
         port = camera.port,
@@ -142,6 +203,14 @@ pub(crate) fn render_user_config(camera: &ConfiguredCamera) -> String {
     config
 }
 
+pub(crate) fn default_workspace() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub(crate) fn default_storage() -> StorageMode {
+    StorageMode::WorkspaceOnly
+}
+
 pub(crate) fn user_config_path() -> io::Result<PathBuf> {
     let Some(home_dir) = current_home_dir() else {
         return Err(io::Error::new(
@@ -153,8 +222,13 @@ pub(crate) fn user_config_path() -> io::Result<PathBuf> {
     Ok(home_dir.join(USER_CONFIG_DIR).join(CONFIG_FILE_NAME))
 }
 
-pub(crate) fn write_user_config(path: &Path, camera: &ConfiguredCamera) -> io::Result<()> {
-    let rendered = render_user_config(camera);
+pub(crate) fn write_user_config(
+    path: &Path,
+    workspace: &Path,
+    storage: StorageMode,
+    camera: &ConfiguredCamera,
+) -> io::Result<()> {
+    let rendered = render_user_config(workspace, storage, camera);
 
     #[cfg(unix)]
     {
@@ -222,6 +296,8 @@ mod tests {
     fn parses_selected_camera_configuration() {
         let config = parse_config(
             "[ArgusCapture]\n\
+             workspace = /var/lib/argus/workspace\n\
+             storage = both\n\
              camera = CanonR3\n\n\
              [CanonR3]\n\
              host = 192.168.1.23\n\
@@ -231,6 +307,8 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(config.workspace(), Path::new("/var/lib/argus/workspace"));
+        assert_eq!(config.storage(), StorageMode::Both);
         assert_eq!(config.selected_camera().name, "CanonR3");
         assert_eq!(config.selected_camera().host, "192.168.1.23");
         assert_eq!(config.selected_camera().port, 80);
@@ -244,6 +322,8 @@ mod tests {
     fn rejects_missing_selected_camera_section() {
         let error = parse_config(
             "[ArgusCapture]\n\
+             workspace = /var/lib/argus/workspace\n\
+             storage = workspace_only\n\
              camera = CanonR3\n\n\
              [OtherCamera]\n\
              host = 192.168.1.23\n\
@@ -258,6 +338,8 @@ mod tests {
     fn rejects_partial_credentials() {
         let error = parse_config(
             "[ArgusCapture]\n\
+             workspace = /var/lib/argus/workspace\n\
+             storage = workspace_only\n\
              camera = CanonR3\n\n\
              [CanonR3]\n\
              host = 192.168.1.23\n\
@@ -271,6 +353,37 @@ mod tests {
                 .to_string()
                 .contains("must define both username and password or neither")
         );
+    }
+
+    #[test]
+    fn defaults_workspace_to_current_directory_when_missing() {
+        let config = parse_config(
+            "[ArgusCapture]\n\
+             camera = CanonR3\n\n\
+             [CanonR3]\n\
+             host = 192.168.1.23\n\
+             port = 80\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.workspace(), default_workspace().as_path());
+        assert_eq!(config.storage(), default_storage());
+    }
+
+    #[test]
+    fn rejects_unknown_storage_mode() {
+        let error = parse_config(
+            "[ArgusCapture]\n\
+             workspace = /var/lib/argus/workspace\n\
+             storage = someday\n\
+             camera = CanonR3\n\n\
+             [CanonR3]\n\
+             host = 192.168.1.23\n\
+             port = 80\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid storage mode `someday`"));
     }
 
     #[test]
@@ -298,17 +411,23 @@ mod tests {
 
     #[test]
     fn renders_user_config_in_ini_format() {
-        let config = render_user_config(&ConfiguredCamera {
-            name: "CanonR3".to_owned(),
-            host: "192.168.1.23".to_owned(),
-            port: 80,
-            username: Some("abbc".to_owned()),
-            password: Some("cbbaabbc".to_owned()),
-        });
+        let config = render_user_config(
+            Path::new("/var/lib/argus/workspace"),
+            StorageMode::Both,
+            &ConfiguredCamera {
+                name: "CanonR3".to_owned(),
+                host: "192.168.1.23".to_owned(),
+                port: 80,
+                username: Some("abbc".to_owned()),
+                password: Some("cbbaabbc".to_owned()),
+            },
+        );
 
         assert_eq!(
             config,
             "[ArgusCapture]\n\
+             workspace = /var/lib/argus/workspace\n\
+             storage = both\n\
              camera = CanonR3\n\n\
              [CanonR3]\n\
              host = 192.168.1.23\n\
@@ -320,17 +439,23 @@ mod tests {
 
     #[test]
     fn omits_blank_optional_credentials_from_rendered_config() {
-        let config = render_user_config(&ConfiguredCamera {
-            name: "CanonR3".to_owned(),
-            host: "192.168.1.23".to_owned(),
-            port: 80,
-            username: None,
-            password: None,
-        });
+        let config = render_user_config(
+            Path::new("/var/lib/argus/workspace"),
+            StorageMode::WorkspaceOnly,
+            &ConfiguredCamera {
+                name: "CanonR3".to_owned(),
+                host: "192.168.1.23".to_owned(),
+                port: 80,
+                username: None,
+                password: None,
+            },
+        );
 
         assert_eq!(
             config,
             "[ArgusCapture]\n\
+             workspace = /var/lib/argus/workspace\n\
+             storage = workspace_only\n\
              camera = CanonR3\n\n\
              [CanonR3]\n\
              host = 192.168.1.23\n\
@@ -348,6 +473,8 @@ mod tests {
 
         write_user_config(
             &config_path,
+            Path::new("/var/lib/argus/workspace"),
+            StorageMode::WorkspaceOnly,
             &ConfiguredCamera {
                 name: "CanonR3".to_owned(),
                 host: "camera.example.local".to_owned(),

@@ -95,6 +95,11 @@ If neither file exists, **Argus Capture** runs without a loaded configuration.
 
 A sample configuration is available at `doc/etc/argus-capture.conf`.
 
+## Documentation
+
+- `doc/BROWSER_REMOTE.md` - Browser Remote reverse-engineering notes
+- `doc/CAMERA_API.md` - Implementation focused camera API guide for the GTK UI
+
 ## Contributing
 
 Contributions to **Argus Capture** are managed on [GitHub.com](https://github.com/ArgusCapture/ArgusCapture/)

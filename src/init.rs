@@ -42,6 +42,8 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
 
     let cameras = network::discover_network_cameras(None).await;
     let selected_camera = choose_camera(&cameras);
+    let default_workspace = config::default_workspace();
+    let storage = config::default_storage();
 
     let mut configured_camera = ConfiguredCamera {
         name: suggest_camera_name(selected_camera.as_ref()),
@@ -53,6 +55,7 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
         username: None,
         password: None,
     };
+    let workspace = prompt_with_default("Workspace", &default_workspace.display().to_string())?;
 
     if configured_camera.host.is_empty() {
         configured_camera.host = prompt_required("Host")?;
@@ -77,7 +80,12 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
         fs::create_dir_all(parent)?;
     }
 
-    config::write_user_config(&config_path, &configured_camera)?;
+    config::write_user_config(
+        &config_path,
+        std::path::Path::new(&workspace),
+        storage,
+        &configured_camera,
+    )?;
     println!("Created {}", config_path.display());
 
     Ok(())

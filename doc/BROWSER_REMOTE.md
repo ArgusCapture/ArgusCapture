@@ -34,6 +34,9 @@ In practice, Browser Remote appears to be a thin JavaScript UI layered on top
 of CCAPI, with a few `/brapi` endpoints for session state, page heartbeats, and
 Browser Remote-only properties.
 
+For the smaller implementation-facing summary that tracks what Argus Capture is
+actively wiring into the GTK UI, see `doc/CAMERA_API.md`.
+
 ## Configuration
 
 The camera connection details come from `argus-capture.conf`, using the same
@@ -43,6 +46,8 @@ The sample file is `doc/etc/argus-capture.conf`.
 
 ```ini
 [ArgusCapture]
+workspace = .
+storage = workspace_only
 camera = Camera1
 
 [Camera1]

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Argus Capture
+Comment=Camera tethering and capture application
+Exec=argus-capture
+TryExec=argus-capture
+Icon=org.arguscapture.ArgusCapture
+Terminal=false
+StartupNotify=true
+Categories=Graphics;Photography;GTK;
+Keywords=camera;capture;photography;tethering;
+StartupWMClass=org.arguscapture.ArgusCapture
