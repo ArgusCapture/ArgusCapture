@@ -171,6 +171,7 @@ fn build_ui(
 
     let connected = Rc::new(Cell::new(false));
     let capture_mode = Rc::new(Cell::new(CaptureMode::Picture));
+    let video_recording = Rc::new(Cell::new(false));
     let rendered_frame_count = Rc::new(Cell::new(0_u64));
     let live_view_session: Rc<RefCell<Option<LiveViewSession>>> = Rc::new(RefCell::new(None));
     let focus_overlay_state = Rc::new(RefCell::new(FocusOverlayState::default()));
@@ -210,8 +211,10 @@ fn build_ui(
     update_capture_mode_controls(
         false,
         capture_mode.get(),
+        video_recording.get(),
         &capture_action,
         &connected_view.capture_button,
+        &connected_view.capture_mode_switch,
     );
 
     {
@@ -234,6 +237,7 @@ fn build_ui(
         let content_stack = connected_view.content_stack.clone();
         let live_view_picture = connected_view.live_view_picture.clone();
         let capture_button = connected_view.capture_button.clone();
+        let capture_mode_switch = connected_view.capture_mode_switch.clone();
         let focus_overlay_state = focus_overlay_state.clone();
         let focus_overlay_area = connected_view.focus_overlay_area.clone();
         let focus_operation_label = connected_view.focus_operation_label.clone();
@@ -241,6 +245,7 @@ fn build_ui(
         let live_view_session = live_view_session.clone();
         let rendered_frame_count = rendered_frame_count.clone();
         let capture_mode = capture_mode.clone();
+        let video_recording = video_recording.clone();
         let connected = connected.clone();
         let configured_camera = configured_camera.clone();
         connect_action.clone().connect_activate(move |_, _| {
@@ -255,6 +260,7 @@ fn build_ui(
                 configured_camera.host, configured_camera.port, configured_camera.name
             ));
             connected.set(true);
+            video_recording.set(false);
             update_connection_state(
                 true,
                 &status_label,
@@ -267,8 +273,10 @@ fn build_ui(
             update_capture_mode_controls(
                 true,
                 capture_mode.get(),
+                video_recording.get(),
                 &capture_action_state,
                 &capture_button,
+                &capture_mode_switch,
             );
             status_label.set_text("Connecting to camera...");
 
@@ -311,6 +319,7 @@ fn build_ui(
         let content_stack = connected_view.content_stack.clone();
         let live_view_picture = connected_view.live_view_picture.clone();
         let capture_button = connected_view.capture_button.clone();
+        let capture_mode_switch = connected_view.capture_mode_switch.clone();
         let focus_overlay_state = focus_overlay_state.clone();
         let focus_overlay_area = connected_view.focus_overlay_area.clone();
         let focus_operation_label = connected_view.focus_operation_label.clone();
@@ -319,10 +328,12 @@ fn build_ui(
         let configured_camera = configured_camera.clone();
         let rendered_frame_count = rendered_frame_count.clone();
         let capture_mode = capture_mode.clone();
+        let video_recording = video_recording.clone();
         let connected = connected.clone();
         disconnect_action.clone().connect_activate(move |_, _| {
             log_live_view("disconnect requested");
             connected.set(false);
+            video_recording.set(false);
             if let Some(session) = live_view_session.borrow_mut().take() {
                 session.stop.store(true, Ordering::Relaxed);
                 if let Ok(pid_slot) = session.child_pid.lock()
@@ -367,8 +378,10 @@ fn build_ui(
             update_capture_mode_controls(
                 false,
                 capture_mode.get(),
+                video_recording.get(),
                 &capture_action_state,
                 &capture_button,
+                &capture_mode_switch,
             );
         });
     }
@@ -378,16 +391,15 @@ fn build_ui(
         let live_view_session = live_view_session.clone();
         let configured_camera = configured_camera.clone();
         let capture_mode = capture_mode.clone();
+        let capture_action_state = capture_action.clone();
         let workspace = workspace.clone();
         let storage = storage.clone();
         let disconnect_action = disconnect_action.clone();
         let connected = connected.clone();
-        capture_action.connect_activate(move |_, _| {
-            if capture_mode.get() != CaptureMode::Picture {
-                status_label.set_text("Video capture is not available yet.");
-                return;
-            }
-
+        let capture_button = connected_view.capture_button.clone();
+        let capture_mode_switch = connected_view.capture_mode_switch.clone();
+        let video_recording = video_recording.clone();
+        capture_action.clone().connect_activate(move |_, _| {
             let camera = configured_camera.borrow().clone();
             let cookie = live_view_session
                 .borrow()
@@ -395,47 +407,134 @@ fn build_ui(
                 .and_then(|session| session.session_cookie.lock().ok()?.clone());
 
             let Some(cookie) = cookie else {
-                status_label.set_text("Picture capture unavailable: no active camera session.");
+                status_label.set_text(if capture_mode.get() == CaptureMode::Picture {
+                    "Picture capture unavailable: no active camera session."
+                } else {
+                    "Video capture unavailable: no active camera session."
+                });
                 return;
             };
 
-            log_live_view(format!(
-                "picture capture requested for {}:{}",
-                camera.host, camera.port
-            ));
-            status_label.set_text("Taking picture...");
-            flush_main_context();
-            match trigger_picture_capture(&camera, &cookie) {
-                Ok(()) => {
-                    let storage_mode = storage.get();
-                    if storage_mode != StorageMode::CameraOnly {
-                        disconnect_action.set_enabled(false);
-                        status_label.set_text("Downloading...");
-                        flush_main_context();
-                    }
-                    let result = apply_storage_policy_to_capture(
-                        &camera,
-                        &cookie,
-                        &workspace.borrow(),
-                        storage_mode,
-                        CapturedMediaKind::Picture,
-                    );
-                    if storage_mode != StorageMode::CameraOnly {
-                        disconnect_action.set_enabled(connected.get());
-                    }
-                    match result {
-                        Ok(message) => status_label.set_text(&message),
+            match capture_mode.get() {
+                CaptureMode::Picture => {
+                    log_live_view(format!(
+                        "picture capture requested for {}:{}",
+                        camera.host, camera.port
+                    ));
+                    status_label.set_text("Taking picture...");
+                    flush_main_context();
+                    match trigger_picture_capture(&camera, &cookie) {
+                        Ok(()) => {
+                            let storage_mode = storage.get();
+                            if storage_mode != StorageMode::CameraOnly {
+                                disconnect_action.set_enabled(false);
+                                status_label.set_text("Downloading...");
+                                flush_main_context();
+                            }
+                            let result = apply_storage_policy_to_capture(
+                                &camera,
+                                &cookie,
+                                &workspace.borrow(),
+                                storage_mode,
+                                CapturedMediaKind::Picture,
+                            );
+                            if storage_mode != StorageMode::CameraOnly {
+                                disconnect_action.set_enabled(connected.get());
+                            }
+                            match result {
+                                Ok(message) => status_label.set_text(&message),
+                                Err(error) => {
+                                    log_live_view(format!(
+                                        "picture storage handling failed: {error}"
+                                    ));
+                                    status_label.set_text(&format!(
+                                        "Picture captured, but storage handling failed: {error}"
+                                    ));
+                                }
+                            }
+                        }
                         Err(error) => {
-                            log_live_view(format!("picture storage handling failed: {error}"));
-                            status_label.set_text(&format!(
-                                "Picture captured, but storage handling failed: {error}"
-                            ));
+                            log_live_view(format!("picture capture failed: {error}"));
+                            status_label.set_text(&format!("Picture capture error: {error}"));
                         }
                     }
                 }
-                Err(error) => {
-                    log_live_view(format!("picture capture failed: {error}"));
-                    status_label.set_text(&format!("Picture capture error: {error}"));
+                CaptureMode::Video => {
+                    if video_recording.get() {
+                        log_live_view(format!(
+                            "video stop requested for {}:{}",
+                            camera.host, camera.port
+                        ));
+                        status_label.set_text("Stopping video...");
+                        flush_main_context();
+                        match stop_video_recording(&camera, &cookie) {
+                            Ok(()) => {
+                                video_recording.set(false);
+                                update_capture_mode_controls(
+                                    connected.get(),
+                                    capture_mode.get(),
+                                    video_recording.get(),
+                                    &capture_action_state,
+                                    &capture_button,
+                                    &capture_mode_switch,
+                                );
+                                let storage_mode = storage.get();
+                                if storage_mode != StorageMode::CameraOnly {
+                                    status_label.set_text("Downloading...");
+                                    flush_main_context();
+                                }
+                                let result = apply_storage_policy_to_capture(
+                                    &camera,
+                                    &cookie,
+                                    &workspace.borrow(),
+                                    storage_mode,
+                                    CapturedMediaKind::Video,
+                                );
+                                disconnect_action.set_enabled(connected.get());
+                                match result {
+                                    Ok(message) => status_label.set_text(&message),
+                                    Err(error) => {
+                                        log_live_view(format!(
+                                            "video storage handling failed: {error}"
+                                        ));
+                                        status_label.set_text(&format!(
+                                            "Video captured, but storage handling failed: {error}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                log_live_view(format!("video stop failed: {error}"));
+                                status_label.set_text(&format!("Video stop error: {error}"));
+                            }
+                        }
+                    } else {
+                        log_live_view(format!(
+                            "video capture requested for {}:{}",
+                            camera.host, camera.port
+                        ));
+                        status_label.set_text("Starting video...");
+                        flush_main_context();
+                        match start_video_recording(&camera, &cookie) {
+                            Ok(()) => {
+                                video_recording.set(true);
+                                disconnect_action.set_enabled(false);
+                                update_capture_mode_controls(
+                                    connected.get(),
+                                    capture_mode.get(),
+                                    video_recording.get(),
+                                    &capture_action_state,
+                                    &capture_button,
+                                    &capture_mode_switch,
+                                );
+                                status_label.set_text("Recording video...");
+                            }
+                            Err(error) => {
+                                log_live_view(format!("video start failed: {error}"));
+                                status_label.set_text(&format!("Video start error: {error}"));
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -447,9 +546,14 @@ fn build_ui(
         let capture_button = connected_view.capture_button.clone();
         let capture_mode = capture_mode.clone();
         let connected = connected.clone();
+        let video_recording = video_recording.clone();
         connected_view
             .capture_mode_switch
             .connect_active_notify(move |capture_mode_switch| {
+                if video_recording.get() {
+                    capture_mode_switch.set_active(capture_mode.get() == CaptureMode::Video);
+                    return;
+                }
                 let mode = if capture_mode_switch.is_active() {
                     CaptureMode::Video
                 } else {
@@ -459,11 +563,17 @@ fn build_ui(
                 update_capture_mode_controls(
                     connected.get(),
                     mode,
+                    video_recording.get(),
                     &capture_action,
                     &capture_button,
+                    capture_mode_switch,
                 );
-                if mode == CaptureMode::Video {
-                    status_label.set_text("Video capture is not available yet.");
+                if connected.get() {
+                    status_label.set_text(if mode == CaptureMode::Picture {
+                        "Picture mode selected."
+                    } else {
+                        "Video mode selected."
+                    });
                 }
             });
     }
@@ -1187,9 +1297,12 @@ fn update_connection_state(
 fn update_capture_mode_controls(
     connected: bool,
     capture_mode: CaptureMode,
+    video_recording: bool,
     capture_action: &gio::SimpleAction,
     capture_button: &Button,
+    capture_mode_switch: &Switch,
 ) {
+    capture_mode_switch.set_sensitive(connected && !video_recording);
     match capture_mode {
         CaptureMode::Picture => {
             capture_button.set_label("Take Picture");
@@ -1198,10 +1311,15 @@ fn update_capture_mode_controls(
             capture_action.set_enabled(connected);
         }
         CaptureMode::Video => {
-            capture_button.set_label("Video Coming Later");
-            capture_button.set_tooltip_text(Some("Video capture is not available yet"));
-            capture_button.set_sensitive(false);
-            capture_action.set_enabled(false);
+            if video_recording {
+                capture_button.set_label("Stop Video");
+                capture_button.set_tooltip_text(Some("Stop video recording"));
+            } else {
+                capture_button.set_label("Take Video");
+                capture_button.set_tooltip_text(Some("Start video recording"));
+            }
+            capture_button.set_sensitive(connected);
+            capture_action.set_enabled(connected);
         }
     }
 }
@@ -1722,6 +1840,83 @@ fn trigger_picture_capture(camera: &ConfiguredCamera, session_cookie: &str) -> R
         Ok(())
     } else {
         Err(format!("picture capture failed with {status}: {body}"))
+    }
+}
+
+fn start_video_recording(camera: &ConfiguredCamera, session_cookie: &str) -> Result<(), String> {
+    set_movie_mode(camera, session_cookie, true)?;
+    thread::sleep(Duration::from_millis(500));
+
+    let base_url = format!("http://{}:{}", camera.host, camera.port);
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    let (status, body) = run_curl_request(
+        "POST",
+        &format!("{base_url}/ccapi/ver100/shooting/control/recbutton"),
+        Some(session_cookie),
+        Some(&referer),
+        Some(r#"{"action":"start"}"#),
+    )?;
+    log_live_view(format!(
+        "video start status={status} body_prefix={}",
+        preview_text(&body)
+    ));
+
+    if status == 200 {
+        Ok(())
+    } else {
+        Err(format!("video start failed with {status}: {body}"))
+    }
+}
+
+fn stop_video_recording(camera: &ConfiguredCamera, session_cookie: &str) -> Result<(), String> {
+    let base_url = format!("http://{}:{}", camera.host, camera.port);
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    let (status, body) = run_curl_request(
+        "POST",
+        &format!("{base_url}/ccapi/ver100/shooting/control/recbutton"),
+        Some(session_cookie),
+        Some(&referer),
+        Some(r#"{"action":"stop"}"#),
+    )?;
+    log_live_view(format!(
+        "video stop status={status} body_prefix={}",
+        preview_text(&body)
+    ));
+
+    if status == 200 {
+        Ok(())
+    } else {
+        Err(format!("video stop failed with {status}: {body}"))
+    }
+}
+
+fn set_movie_mode(
+    camera: &ConfiguredCamera,
+    session_cookie: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let base_url = format!("http://{}:{}", camera.host, camera.port);
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    let action = if enabled { "on" } else { "off" };
+    let body = format!(r#"{{"action":"{action}"}}"#);
+    let (status, response_body) = run_curl_request(
+        "POST",
+        &format!("{base_url}/ccapi/ver100/shooting/control/moviemode"),
+        Some(session_cookie),
+        Some(&referer),
+        Some(&body),
+    )?;
+    log_live_view(format!(
+        "movie mode status={status} action={action} body_prefix={}",
+        preview_text(&response_body)
+    ));
+
+    if status == 200 {
+        Ok(())
+    } else {
+        Err(format!(
+            "movie mode `{action}` failed with {status}: {response_body}"
+        ))
     }
 }
 

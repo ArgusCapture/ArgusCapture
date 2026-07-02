@@ -143,16 +143,17 @@ sequence:
 That sequence should be the first fallback to try before inventing a different
 capture path.
 
-## Video-control plan
+## Video-control behavior
 
-The UI now exposes a picture/video mode switch, but only picture mode is wired.
+The UI now exposes a picture/video mode switch.
 
-The next video path to test is:
+In video mode:
 
-1. switch to movie mode
-2. start recording
-3. stop recording
-4. reflect movie state back into the UI
+1. the capture button is labeled `Take Video`
+2. pressing it switches the camera to movie mode and starts recording
+3. the button changes to `Stop Video`
+4. pressing it again stops recording
+5. the configured storage policy is then applied to the recorded file
 
 Candidate endpoints already identified from Browser Remote:
 
@@ -182,7 +183,7 @@ storage = workspace_only
 camera = Camera1
 ```
 
-Current storage-policy behavior for still capture:
+Current storage-policy behavior for capture:
 
 - `camera_only`: trigger capture and leave the file on the camera
 - `workspace_only`: wait for the new camera content path, download it to the
@@ -192,7 +193,8 @@ Current storage-policy behavior for still capture:
 
 The implementation uses `addedcontents` from event polling to find the exact
 camera content path that was created by the capture. That returned content path
-is then reused directly for download and optional deletion.
+is then reused directly for download and optional deletion for both still images
+and videos.
 
 ## cURL cookbook
 
