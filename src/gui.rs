@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, Dialog, DrawingArea, DropDown,
     Entry, FileChooserAction, FileChooserNative, Grid, Label, Orientation, Overlay, Picture,
-    PopoverMenuBar, ResponseType, SpinButton, Stack, StackSwitcher, Switch,
+    PopoverMenuBar, ResponseType, SpinButton, Stack, StackSwitcher, StringList, Switch,
 };
 use serde_json::Value;
 use tokio::runtime::Builder;
@@ -60,16 +61,71 @@ struct LiveViewSession {
     worker: thread::JoinHandle<()>,
 }
 
+struct LiveViewUiBindings {
+    live_view_picture: Picture,
+    status_label: Label,
+    connect_action: gio::SimpleAction,
+    disconnect_action: gio::SimpleAction,
+    capture_action: gio::SimpleAction,
+    focus_action: gio::SimpleAction,
+    content_stack: Stack,
+    startup_logo: Picture,
+    startup_blink_source: Rc<RefCell<Option<SourceId>>>,
+    rendered_frame_count: Rc<Cell<u64>>,
+    focus_overlay_state: Rc<RefCell<FocusOverlayState>>,
+    focus_overlay_area: DrawingArea,
+    focus_operation_label: Label,
+    focus_method_label: Label,
+    mode_label: Label,
+    mode_dropdown: DropDown,
+    iso_label: Label,
+    iso_dropdown: DropDown,
+    shutter_speed_label: Label,
+    shutter_speed_dropdown: DropDown,
+    aperture_label: Label,
+    aperture_dropdown: DropDown,
+    mode_dropdown_updating: Rc<Cell<bool>>,
+    iso_dropdown_updating: Rc<Cell<bool>>,
+    shutter_speed_dropdown_updating: Rc<Cell<bool>>,
+    aperture_dropdown_updating: Rc<Cell<bool>>,
+    capture_settings_cache: Rc<RefCell<Option<CaptureSettingsCache>>>,
+}
+
+#[derive(Clone)]
+struct CaptureSettingsControls {
+    mode_label: Label,
+    mode_dropdown: DropDown,
+    iso_label: Label,
+    iso_dropdown: DropDown,
+    shutter_speed_label: Label,
+    shutter_speed_dropdown: DropDown,
+    aperture_label: Label,
+    aperture_dropdown: DropDown,
+    mode_dropdown_updating: Rc<Cell<bool>>,
+    iso_dropdown_updating: Rc<Cell<bool>>,
+    shutter_speed_dropdown_updating: Rc<Cell<bool>>,
+    aperture_dropdown_updating: Rc<Cell<bool>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CaptureSettingsCache {
+    current_mode: String,
+    by_mode: HashMap<String, CaptureSettingsState>,
+}
+
 enum LiveViewEvent {
     Frame(Vec<u8>),
     FocusOverlay(FocusOverlayState),
     FocusMode(FocusModeState),
+    CaptureSettings(CaptureSettingsState),
+    CaptureSettingsCache(CaptureSettingsCache),
     Error(String),
 }
 
 struct ConnectedView {
     content: GtkBox,
     content_stack: Stack,
+    startup_logo: Picture,
     live_view_picture: Picture,
     capture_mode_switch: Switch,
     capture_button: Button,
@@ -85,6 +141,14 @@ struct ConnectedView {
     focus_move_left: Button,
     focus_trigger_button: Button,
     focus_move_right: Button,
+    mode_label: Label,
+    mode_dropdown: DropDown,
+    iso_label: Label,
+    iso_dropdown: DropDown,
+    shutter_speed_label: Label,
+    shutter_speed_dropdown: DropDown,
+    aperture_label: Label,
+    aperture_dropdown: DropDown,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -106,6 +170,26 @@ struct FocusModeState {
     method: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SelectableSettingState {
+    current: String,
+    ability: Vec<String>,
+}
+
+impl SelectableSettingState {
+    fn is_available(&self) -> bool {
+        !self.ability.is_empty() || !self.current.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CaptureSettingsState {
+    mode: SelectableSettingState,
+    iso: SelectableSettingState,
+    shutter_speed: SelectableSettingState,
+    aperture: SelectableSettingState,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum FocusDirection {
     UpLeft,
@@ -122,6 +206,13 @@ enum FocusDirection {
 enum CaptureMode {
     Picture,
     Video,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentViewState {
+    Disconnected,
+    Starting,
+    Connected,
 }
 
 #[allow(dead_code)]
@@ -175,6 +266,10 @@ fn build_ui(
     let rendered_frame_count = Rc::new(Cell::new(0_u64));
     let live_view_session: Rc<RefCell<Option<LiveViewSession>>> = Rc::new(RefCell::new(None));
     let focus_overlay_state = Rc::new(RefCell::new(FocusOverlayState::default()));
+    let mode_dropdown_updating = Rc::new(Cell::new(false));
+    let iso_dropdown_updating = Rc::new(Cell::new(false));
+    let shutter_speed_dropdown_updating = Rc::new(Cell::new(false));
+    let aperture_dropdown_updating = Rc::new(Cell::new(false));
     let connect_action = gio::SimpleAction::new("camera-connect", None);
     let disconnect_action = gio::SimpleAction::new("camera-disconnect", None);
     let capture_action = gio::SimpleAction::new("camera-capture", None);
@@ -199,8 +294,25 @@ fn build_ui(
     application.set_accels_for_action("app.help-about", &["a"]);
 
     let connected_view = build_content_view(focus_overlay_state.clone());
+    let capture_settings_controls = CaptureSettingsControls {
+        mode_label: connected_view.mode_label.clone(),
+        mode_dropdown: connected_view.mode_dropdown.clone(),
+        iso_label: connected_view.iso_label.clone(),
+        iso_dropdown: connected_view.iso_dropdown.clone(),
+        shutter_speed_label: connected_view.shutter_speed_label.clone(),
+        shutter_speed_dropdown: connected_view.shutter_speed_dropdown.clone(),
+        aperture_label: connected_view.aperture_label.clone(),
+        aperture_dropdown: connected_view.aperture_dropdown.clone(),
+        mode_dropdown_updating: mode_dropdown_updating.clone(),
+        iso_dropdown_updating: iso_dropdown_updating.clone(),
+        shutter_speed_dropdown_updating: shutter_speed_dropdown_updating.clone(),
+        aperture_dropdown_updating: aperture_dropdown_updating.clone(),
+    };
+    let capture_settings_cache: Rc<RefCell<Option<CaptureSettingsCache>>> =
+        Rc::new(RefCell::new(None));
+    let startup_blink_source: Rc<RefCell<Option<SourceId>>> = Rc::new(RefCell::new(None));
     update_connection_state(
-        false,
+        ContentViewState::Disconnected,
         &status_label,
         &connect_action,
         &disconnect_action,
@@ -235,6 +347,7 @@ fn build_ui(
         let capture_action_state = capture_action.clone();
         let focus_action_state = focus_action.clone();
         let content_stack = connected_view.content_stack.clone();
+        let startup_logo = connected_view.startup_logo.clone();
         let live_view_picture = connected_view.live_view_picture.clone();
         let capture_button = connected_view.capture_button.clone();
         let capture_mode_switch = connected_view.capture_mode_switch.clone();
@@ -242,11 +355,25 @@ fn build_ui(
         let focus_overlay_area = connected_view.focus_overlay_area.clone();
         let focus_operation_label = connected_view.focus_operation_label.clone();
         let focus_method_label = connected_view.focus_method_label.clone();
+        let mode_label = connected_view.mode_label.clone();
+        let mode_dropdown = connected_view.mode_dropdown.clone();
+        let iso_label = connected_view.iso_label.clone();
+        let iso_dropdown = connected_view.iso_dropdown.clone();
+        let shutter_speed_label = connected_view.shutter_speed_label.clone();
+        let shutter_speed_dropdown = connected_view.shutter_speed_dropdown.clone();
+        let aperture_label = connected_view.aperture_label.clone();
+        let aperture_dropdown = connected_view.aperture_dropdown.clone();
         let live_view_session = live_view_session.clone();
         let rendered_frame_count = rendered_frame_count.clone();
         let capture_mode = capture_mode.clone();
         let video_recording = video_recording.clone();
         let connected = connected.clone();
+        let mode_dropdown_updating = mode_dropdown_updating.clone();
+        let iso_dropdown_updating = iso_dropdown_updating.clone();
+        let shutter_speed_dropdown_updating = shutter_speed_dropdown_updating.clone();
+        let aperture_dropdown_updating = aperture_dropdown_updating.clone();
+        let capture_settings_cache = capture_settings_cache.clone();
+        let startup_blink_source = startup_blink_source.clone();
         let configured_camera = configured_camera.clone();
         connect_action.clone().connect_activate(move |_, _| {
             let configured_camera = configured_camera.borrow().clone();
@@ -261,8 +388,10 @@ fn build_ui(
             ));
             connected.set(true);
             video_recording.set(false);
+            *capture_settings_cache.borrow_mut() = None;
+            start_starting_animation(&startup_logo, &startup_blink_source);
             update_connection_state(
-                true,
+                ContentViewState::Starting,
                 &status_label,
                 &connect_action_state,
                 &disconnect_action_state,
@@ -294,13 +423,35 @@ fn build_ui(
             let rendered_frame_counter = rendered_frame_count.clone();
             let session = start_live_view_session(
                 configured_camera,
-                live_view_picture.clone(),
-                status_label.clone(),
-                rendered_frame_counter,
-                focus_overlay_state.clone(),
-                focus_overlay_area.clone(),
-                focus_operation_label.clone(),
-                focus_method_label.clone(),
+                LiveViewUiBindings {
+                    live_view_picture: live_view_picture.clone(),
+                    status_label: status_label.clone(),
+                    connect_action: connect_action_state.clone(),
+                    disconnect_action: disconnect_action_state.clone(),
+                    capture_action: capture_action_state.clone(),
+                    focus_action: focus_action_state.clone(),
+                    content_stack: content_stack.clone(),
+                    startup_logo: startup_logo.clone(),
+                    startup_blink_source: startup_blink_source.clone(),
+                    rendered_frame_count: rendered_frame_counter,
+                    focus_overlay_state: focus_overlay_state.clone(),
+                    focus_overlay_area: focus_overlay_area.clone(),
+                    focus_operation_label: focus_operation_label.clone(),
+                    focus_method_label: focus_method_label.clone(),
+                    mode_label: mode_label.clone(),
+                    mode_dropdown: mode_dropdown.clone(),
+                    iso_label: iso_label.clone(),
+                    iso_dropdown: iso_dropdown.clone(),
+                    shutter_speed_label: shutter_speed_label.clone(),
+                    shutter_speed_dropdown: shutter_speed_dropdown.clone(),
+                    aperture_label: aperture_label.clone(),
+                    aperture_dropdown: aperture_dropdown.clone(),
+                    mode_dropdown_updating: mode_dropdown_updating.clone(),
+                    iso_dropdown_updating: iso_dropdown_updating.clone(),
+                    shutter_speed_dropdown_updating: shutter_speed_dropdown_updating.clone(),
+                    aperture_dropdown_updating: aperture_dropdown_updating.clone(),
+                    capture_settings_cache: capture_settings_cache.clone(),
+                },
             );
             *live_view_session.borrow_mut() = Some(session);
         });
@@ -317,6 +468,7 @@ fn build_ui(
         let capture_action_state = capture_action.clone();
         let focus_action_state = focus_action.clone();
         let content_stack = connected_view.content_stack.clone();
+        let startup_logo = connected_view.startup_logo.clone();
         let live_view_picture = connected_view.live_view_picture.clone();
         let capture_button = connected_view.capture_button.clone();
         let capture_mode_switch = connected_view.capture_mode_switch.clone();
@@ -324,16 +476,31 @@ fn build_ui(
         let focus_overlay_area = connected_view.focus_overlay_area.clone();
         let focus_operation_label = connected_view.focus_operation_label.clone();
         let focus_method_label = connected_view.focus_method_label.clone();
+        let mode_label = connected_view.mode_label.clone();
+        let mode_dropdown = connected_view.mode_dropdown.clone();
+        let iso_label = connected_view.iso_label.clone();
+        let iso_dropdown = connected_view.iso_dropdown.clone();
+        let shutter_speed_label = connected_view.shutter_speed_label.clone();
+        let shutter_speed_dropdown = connected_view.shutter_speed_dropdown.clone();
+        let aperture_label = connected_view.aperture_label.clone();
+        let aperture_dropdown = connected_view.aperture_dropdown.clone();
         let live_view_session = live_view_session.clone();
         let configured_camera = configured_camera.clone();
         let rendered_frame_count = rendered_frame_count.clone();
         let capture_mode = capture_mode.clone();
         let video_recording = video_recording.clone();
         let connected = connected.clone();
+        let startup_blink_source = startup_blink_source.clone();
+        let mode_dropdown_updating = mode_dropdown_updating.clone();
+        let iso_dropdown_updating = iso_dropdown_updating.clone();
+        let shutter_speed_dropdown_updating = shutter_speed_dropdown_updating.clone();
+        let aperture_dropdown_updating = aperture_dropdown_updating.clone();
+        let capture_settings_cache = capture_settings_cache.clone();
         disconnect_action.clone().connect_activate(move |_, _| {
             log_live_view("disconnect requested");
             connected.set(false);
             video_recording.set(false);
+            *capture_settings_cache.borrow_mut() = None;
             if let Some(session) = live_view_session.borrow_mut().take() {
                 session.stop.store(true, Ordering::Relaxed);
                 if let Ok(pid_slot) = session.child_pid.lock()
@@ -362,12 +529,45 @@ fn build_ui(
             }
             rendered_frame_count.set(0);
             live_view_picture.set_paintable(Option::<&gtk::gdk::Texture>::None);
+            stop_starting_animation(&startup_logo, &startup_blink_source);
             *focus_overlay_state.borrow_mut() = FocusOverlayState::default();
             focus_overlay_area.queue_draw();
             focus_operation_label.set_text("AF mode: -");
             focus_method_label.set_text("AF method: -");
-            update_connection_state(
+            update_selectable_setting_dropdown(
+                &mode_label,
+                &mode_dropdown,
+                &SelectableSettingState::default(),
                 false,
+                &mode_dropdown_updating,
+                "shootingmode",
+            );
+            update_selectable_setting_dropdown(
+                &iso_label,
+                &iso_dropdown,
+                &SelectableSettingState::default(),
+                false,
+                &iso_dropdown_updating,
+                "iso",
+            );
+            update_selectable_setting_dropdown(
+                &shutter_speed_label,
+                &shutter_speed_dropdown,
+                &SelectableSettingState::default(),
+                false,
+                &shutter_speed_dropdown_updating,
+                "tv",
+            );
+            update_selectable_setting_dropdown(
+                &aperture_label,
+                &aperture_dropdown,
+                &SelectableSettingState::default(),
+                false,
+                &aperture_dropdown_updating,
+                "av",
+            );
+            update_connection_state(
+                ContentViewState::Disconnected,
                 &status_label,
                 &connect_action_state,
                 &disconnect_action_state,
@@ -575,6 +775,177 @@ fn build_ui(
                         "Video mode selected."
                     });
                 }
+            });
+    }
+
+    {
+        let status_label = status_label.clone();
+        let live_view_session = live_view_session.clone();
+        let configured_camera = configured_camera.clone();
+        let dropdown_updating = mode_dropdown_updating.clone();
+        let capture_settings_controls = capture_settings_controls.clone();
+        let capture_settings_cache = capture_settings_cache.clone();
+        connected_view
+            .mode_dropdown
+            .connect_selected_notify(move |dropdown| {
+                if dropdown_updating.get() {
+                    return;
+                }
+
+                let Some(value) = selected_dropdown_value(dropdown, "shootingmode") else {
+                    return;
+                };
+
+                let camera = configured_camera.borrow().clone();
+                let cookie = live_view_session
+                    .borrow()
+                    .as_ref()
+                    .and_then(|session| session.session_cookie.lock().ok()?.clone());
+                let Some(cookie) = cookie else {
+                    status_label.set_text("Mode unavailable: no active camera session.");
+                    return;
+                };
+
+                apply_selectable_setting_change_async(
+                    camera,
+                    cookie,
+                    "shootingmode",
+                    value.clone(),
+                    capture_settings_controls.clone(),
+                    capture_settings_cache.clone(),
+                    status_label.clone(),
+                    format!(
+                        "Mode set to {}.",
+                        display_selectable_setting_value("shootingmode", &value)
+                    ),
+                    "Mode",
+                );
+            });
+    }
+
+    {
+        let status_label = status_label.clone();
+        let live_view_session = live_view_session.clone();
+        let configured_camera = configured_camera.clone();
+        let dropdown_updating = iso_dropdown_updating.clone();
+        let capture_settings_controls = capture_settings_controls.clone();
+        let capture_settings_cache = capture_settings_cache.clone();
+        connected_view
+            .iso_dropdown
+            .connect_selected_notify(move |dropdown| {
+                if dropdown_updating.get() {
+                    return;
+                }
+
+                let Some(value) = selected_dropdown_value(dropdown, "iso") else {
+                    return;
+                };
+
+                let camera = configured_camera.borrow().clone();
+                let cookie = live_view_session
+                    .borrow()
+                    .as_ref()
+                    .and_then(|session| session.session_cookie.lock().ok()?.clone());
+                let Some(cookie) = cookie else {
+                    status_label.set_text("ISO unavailable: no active camera session.");
+                    return;
+                };
+
+                apply_selectable_setting_change_async(
+                    camera,
+                    cookie,
+                    "iso",
+                    value.clone(),
+                    capture_settings_controls.clone(),
+                    capture_settings_cache.clone(),
+                    status_label.clone(),
+                    format!("ISO set to {value}."),
+                    "ISO",
+                );
+            });
+    }
+
+    {
+        let status_label = status_label.clone();
+        let live_view_session = live_view_session.clone();
+        let configured_camera = configured_camera.clone();
+        let dropdown_updating = shutter_speed_dropdown_updating.clone();
+        let capture_settings_controls = capture_settings_controls.clone();
+        let capture_settings_cache = capture_settings_cache.clone();
+        connected_view
+            .shutter_speed_dropdown
+            .connect_selected_notify(move |dropdown| {
+                if dropdown_updating.get() {
+                    return;
+                }
+
+                let Some(value) = selected_dropdown_value(dropdown, "tv") else {
+                    return;
+                };
+
+                let camera = configured_camera.borrow().clone();
+                let cookie = live_view_session
+                    .borrow()
+                    .as_ref()
+                    .and_then(|session| session.session_cookie.lock().ok()?.clone());
+                let Some(cookie) = cookie else {
+                    status_label.set_text("Shutter speed unavailable: no active camera session.");
+                    return;
+                };
+
+                apply_selectable_setting_change_async(
+                    camera,
+                    cookie,
+                    "tv",
+                    value.clone(),
+                    capture_settings_controls.clone(),
+                    capture_settings_cache.clone(),
+                    status_label.clone(),
+                    format!("Shutter speed set to {value}."),
+                    "Shutter speed",
+                );
+            });
+    }
+
+    {
+        let status_label = status_label.clone();
+        let live_view_session = live_view_session.clone();
+        let configured_camera = configured_camera.clone();
+        let dropdown_updating = aperture_dropdown_updating.clone();
+        let capture_settings_controls = capture_settings_controls.clone();
+        let capture_settings_cache = capture_settings_cache.clone();
+        connected_view
+            .aperture_dropdown
+            .connect_selected_notify(move |dropdown| {
+                if dropdown_updating.get() {
+                    return;
+                }
+
+                let Some(value) = selected_dropdown_value(dropdown, "av") else {
+                    return;
+                };
+
+                let camera = configured_camera.borrow().clone();
+                let cookie = live_view_session
+                    .borrow()
+                    .as_ref()
+                    .and_then(|session| session.session_cookie.lock().ok()?.clone());
+                let Some(cookie) = cookie else {
+                    status_label.set_text("Aperture unavailable: no active camera session.");
+                    return;
+                };
+
+                apply_selectable_setting_change_async(
+                    camera,
+                    cookie,
+                    "av",
+                    value.clone(),
+                    capture_settings_controls.clone(),
+                    capture_settings_cache.clone(),
+                    status_label.clone(),
+                    format!("Aperture set to {value}."),
+                    "Aperture",
+                );
             });
     }
 
@@ -834,6 +1205,20 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
     logo.set_valign(Align::Center);
     disconnected.append(&logo);
 
+    let starting = GtkBox::new(Orientation::Vertical, 12);
+    starting.set_hexpand(true);
+    starting.set_vexpand(true);
+    starting.set_halign(Align::Center);
+    starting.set_valign(Align::Center);
+
+    let startup_logo = logo_picture(LOGO_256X256);
+    startup_logo.set_halign(Align::Center);
+    startup_logo.set_valign(Align::Center);
+    let startup_label = Label::new(Some("Starting..."));
+    startup_label.set_halign(Align::Center);
+    starting.append(&startup_logo);
+    starting.append(&startup_label);
+
     let connected = GtkBox::new(Orientation::Horizontal, 16);
     connected.set_hexpand(true);
     connected.set_vexpand(true);
@@ -932,6 +1317,42 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
     focus_grid.attach(&focus_move_down, 1, 2, 1, 1);
     focus_grid.attach(&focus_move_down_right, 2, 2, 1, 1);
 
+    let exposure_title = Label::new(Some("Exposure"));
+    exposure_title.set_halign(Align::Start);
+    exposure_title.add_css_class("heading");
+
+    let settings_grid = Grid::builder()
+        .column_spacing(12)
+        .row_spacing(12)
+        .hexpand(true)
+        .build();
+    let mode_label = Label::builder().label("Mode").halign(Align::End).build();
+    let iso_label = Label::builder().label("ISO").halign(Align::End).build();
+    let shutter_speed_label = Label::builder()
+        .label("Shutter speed")
+        .halign(Align::End)
+        .build();
+    let aperture_label = Label::builder()
+        .label("Aperture")
+        .halign(Align::End)
+        .build();
+    let mode_dropdown = DropDown::from_strings(&["-"]);
+    let iso_dropdown = DropDown::from_strings(&["-"]);
+    let shutter_speed_dropdown = DropDown::from_strings(&["-"]);
+    let aperture_dropdown = DropDown::from_strings(&["-"]);
+    mode_dropdown.set_sensitive(false);
+    iso_dropdown.set_sensitive(false);
+    shutter_speed_dropdown.set_sensitive(false);
+    aperture_dropdown.set_sensitive(false);
+    settings_grid.attach(&mode_label, 0, 0, 1, 1);
+    settings_grid.attach(&mode_dropdown, 1, 0, 1, 1);
+    settings_grid.attach(&iso_label, 0, 1, 1, 1);
+    settings_grid.attach(&iso_dropdown, 1, 1, 1, 1);
+    settings_grid.attach(&shutter_speed_label, 0, 2, 1, 1);
+    settings_grid.attach(&shutter_speed_dropdown, 1, 2, 1, 1);
+    settings_grid.attach(&aperture_label, 0, 3, 1, 1);
+    settings_grid.attach(&aperture_dropdown, 1, 3, 1, 1);
+
     side_panel.append(&capture_title);
     side_panel.append(&capture_mode_row);
     side_panel.append(&capture_button);
@@ -939,16 +1360,20 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
     side_panel.append(&focus_operation_label);
     side_panel.append(&focus_method_label);
     side_panel.append(&focus_grid);
+    side_panel.append(&exposure_title);
+    side_panel.append(&settings_grid);
 
     connected.append(&live_view_overlay);
     connected.append(&side_panel);
 
     stack.add_named(&disconnected, Some("disconnected"));
+    stack.add_named(&starting, Some("starting"));
     stack.add_named(&connected, Some("connected"));
     content.append(&stack);
     ConnectedView {
         content,
         content_stack: stack,
+        startup_logo,
         live_view_picture,
         capture_mode_switch,
         capture_button,
@@ -964,6 +1389,14 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
         focus_move_left,
         focus_trigger_button,
         focus_move_right,
+        mode_label,
+        mode_dropdown,
+        iso_label,
+        iso_dropdown,
+        shutter_speed_label,
+        shutter_speed_dropdown,
+        aperture_label,
+        aperture_dropdown,
     }
 }
 
@@ -1270,7 +1703,7 @@ fn storage_mode_from_index(index: u32) -> StorageMode {
 }
 
 fn update_connection_state(
-    connected: bool,
+    state: ContentViewState,
     status_label: &Label,
     connect_action: &gio::SimpleAction,
     disconnect_action: &gio::SimpleAction,
@@ -1278,20 +1711,32 @@ fn update_connection_state(
     focus_action: &gio::SimpleAction,
     content_stack: &Stack,
 ) {
-    status_label.set_text(if connected {
-        "Camera connected."
-    } else {
-        "Camera disconnected."
-    });
-    connect_action.set_enabled(!connected);
-    disconnect_action.set_enabled(connected);
-    capture_action.set_enabled(connected);
-    focus_action.set_enabled(connected);
-    content_stack.set_visible_child_name(if connected {
-        "connected"
-    } else {
-        "disconnected"
-    });
+    match state {
+        ContentViewState::Disconnected => {
+            status_label.set_text("Camera disconnected.");
+            connect_action.set_enabled(true);
+            disconnect_action.set_enabled(false);
+            capture_action.set_enabled(false);
+            focus_action.set_enabled(false);
+            content_stack.set_visible_child_name("disconnected");
+        }
+        ContentViewState::Starting => {
+            status_label.set_text("Starting...");
+            connect_action.set_enabled(false);
+            disconnect_action.set_enabled(false);
+            capture_action.set_enabled(false);
+            focus_action.set_enabled(false);
+            content_stack.set_visible_child_name("starting");
+        }
+        ContentViewState::Connected => {
+            status_label.set_text("Camera connected.");
+            connect_action.set_enabled(false);
+            disconnect_action.set_enabled(true);
+            capture_action.set_enabled(true);
+            focus_action.set_enabled(true);
+            content_stack.set_visible_child_name("connected");
+        }
+    }
 }
 
 fn update_capture_mode_controls(
@@ -1322,6 +1767,301 @@ fn update_capture_mode_controls(
             capture_action.set_enabled(connected);
         }
     }
+}
+
+fn update_selectable_setting_dropdown(
+    label: &Label,
+    dropdown: &DropDown,
+    state: &SelectableSettingState,
+    connected: bool,
+    updating: &Cell<bool>,
+    setting_name: &str,
+) {
+    updating.set(true);
+
+    let mut raw_values = if state.ability.is_empty() {
+        if state.current.is_empty() {
+            vec!["-".to_owned()]
+        } else {
+            vec![state.current.clone()]
+        }
+    } else {
+        state.ability.clone()
+    };
+
+    if !state.current.is_empty() && !raw_values.iter().any(|value| value == &state.current) {
+        raw_values.insert(0, state.current.clone());
+    }
+
+    let model = StringList::new(&[]);
+    for value in &raw_values {
+        model.append(&display_selectable_setting_value(setting_name, value));
+    }
+    dropdown.set_model(Some(&model));
+
+    let selected_index = raw_values
+        .iter()
+        .position(|value| value == &state.current)
+        .unwrap_or(0) as u32;
+    dropdown.set_selected(selected_index);
+    let enabled = connected && state.is_available();
+    label.set_sensitive(enabled);
+    dropdown.set_sensitive(enabled);
+
+    updating.set(false);
+}
+
+fn selected_dropdown_value(dropdown: &DropDown, setting_name: &str) -> Option<String> {
+    dropdown
+        .selected_item()
+        .and_then(|item| item.downcast::<gtk::StringObject>().ok())
+        .map(|item| internal_selectable_setting_value(setting_name, &item.string()))
+        .filter(|value| value != "-")
+}
+
+fn display_selectable_setting_value(setting_name: &str, value: &str) -> String {
+    if setting_name == "shootingmode" {
+        match value {
+            "fv" => "Flexible priority (Fv)".to_owned(),
+            "p" => "Program AE (P)".to_owned(),
+            "av" => "Aperture priority (Av)".to_owned(),
+            "tv" => "Shutter priority (Tv)".to_owned(),
+            "m" => "Manual (M)".to_owned(),
+            "bulb" => "Bulb".to_owned(),
+            "c1" => "Custom 1 (C1)".to_owned(),
+            "c2" => "Custom 2 (C2)".to_owned(),
+            "c3" => "Custom 3 (C3)".to_owned(),
+            "auto" => "Auto".to_owned(),
+            other => other.to_owned(),
+        }
+    } else {
+        value.to_owned()
+    }
+}
+
+fn internal_selectable_setting_value(setting_name: &str, value: &str) -> String {
+    if setting_name == "shootingmode" {
+        match value {
+            "Flexible priority (Fv)" => "fv".to_owned(),
+            "Program AE (P)" => "p".to_owned(),
+            "Aperture priority (Av)" => "av".to_owned(),
+            "Shutter priority (Tv)" => "tv".to_owned(),
+            "Manual (M)" => "m".to_owned(),
+            "Bulb" => "bulb".to_owned(),
+            "Custom 1 (C1)" => "c1".to_owned(),
+            "Custom 2 (C2)" => "c2".to_owned(),
+            "Custom 3 (C3)" => "c3".to_owned(),
+            "Auto" => "auto".to_owned(),
+            other => other.to_owned(),
+        }
+    } else {
+        value.to_owned()
+    }
+}
+
+fn update_capture_settings_controls(
+    controls: &CaptureSettingsControls,
+    state: &CaptureSettingsState,
+    connected: bool,
+) {
+    update_selectable_setting_dropdown(
+        &controls.mode_label,
+        &controls.mode_dropdown,
+        &state.mode,
+        connected,
+        &controls.mode_dropdown_updating,
+        "shootingmode",
+    );
+    update_selectable_setting_dropdown(
+        &controls.iso_label,
+        &controls.iso_dropdown,
+        &state.iso,
+        connected,
+        &controls.iso_dropdown_updating,
+        "iso",
+    );
+    update_selectable_setting_dropdown(
+        &controls.shutter_speed_label,
+        &controls.shutter_speed_dropdown,
+        &state.shutter_speed,
+        connected,
+        &controls.shutter_speed_dropdown_updating,
+        "tv",
+    );
+    update_selectable_setting_dropdown(
+        &controls.aperture_label,
+        &controls.aperture_dropdown,
+        &state.aperture,
+        connected,
+        &controls.aperture_dropdown_updating,
+        "av",
+    );
+}
+
+fn set_capture_settings_controls_sensitive(controls: &CaptureSettingsControls, sensitive: bool) {
+    controls.mode_label.set_sensitive(sensitive);
+    controls.mode_dropdown.set_sensitive(sensitive);
+    controls.iso_label.set_sensitive(sensitive);
+    controls.iso_dropdown.set_sensitive(sensitive);
+    controls.shutter_speed_label.set_sensitive(sensitive);
+    controls.shutter_speed_dropdown.set_sensitive(sensitive);
+    controls.aperture_label.set_sensitive(sensitive);
+    controls.aperture_dropdown.set_sensitive(sensitive);
+}
+
+fn apply_cached_selectable_setting_change(
+    capture_settings_cache: &Rc<RefCell<Option<CaptureSettingsCache>>>,
+    setting_name: &str,
+    value: &str,
+) -> Option<CaptureSettingsState> {
+    let mut cache_ref = capture_settings_cache.borrow_mut();
+    let cache = cache_ref.as_mut()?;
+
+    if setting_name == "shootingmode" {
+        cache.current_mode = value.to_owned();
+        return cache.by_mode.get(value).cloned();
+    }
+
+    let current_mode = cache.current_mode.clone();
+    let state = cache.by_mode.get_mut(&current_mode)?;
+    match setting_name {
+        "iso" => state.iso.current = value.to_owned(),
+        "tv" => state.shutter_speed.current = value.to_owned(),
+        "av" => state.aperture.current = value.to_owned(),
+        _ => return None,
+    }
+    Some(state.clone())
+}
+
+fn apply_selectable_setting_change_async(
+    camera: ConfiguredCamera,
+    session_cookie: String,
+    setting_name: &'static str,
+    value: String,
+    controls: CaptureSettingsControls,
+    capture_settings_cache: Rc<RefCell<Option<CaptureSettingsCache>>>,
+    status_label: Label,
+    success_message: String,
+    status_prefix: &'static str,
+) {
+    set_capture_settings_controls_sensitive(&controls, false);
+    status_label.set_text(&format!("Updating {status_prefix}..."));
+    flush_main_context();
+
+    let controls = controls.clone();
+    let capture_settings_cache = capture_settings_cache.clone();
+    let status_label = status_label.clone();
+    let worker_value = value.clone();
+    let (sender, receiver) = mpsc::channel::<Result<(), String>>();
+
+    thread::spawn(move || {
+        let update_result =
+            update_selectable_camera_setting(&camera, &session_cookie, setting_name, &worker_value);
+        let _ = sender.send(update_result);
+    });
+
+    let _ = glib::timeout_add_local(Duration::from_millis(33), move || {
+        match receiver.try_recv() {
+            Ok(result) => {
+                match result {
+                    Ok(()) => {
+                        if let Some(state) = apply_cached_selectable_setting_change(
+                            &capture_settings_cache,
+                            setting_name,
+                            &value,
+                        ) {
+                            update_capture_settings_controls(&controls, &state, true);
+                        } else {
+                            set_capture_settings_controls_sensitive(&controls, true);
+                        }
+                        status_label.set_text(&success_message);
+                    }
+                    Err(error) => {
+                        set_capture_settings_controls_sensitive(&controls, true);
+                        log_live_view(format!("{setting_name} update failed: {error}"));
+                        status_label.set_text(&format!("{status_prefix} error: {error}"));
+                    }
+                }
+                ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                set_capture_settings_controls_sensitive(&controls, true);
+                status_label.set_text(&format!("{status_prefix} error: update worker stopped."));
+                ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn fetch_capture_settings_state(
+    camera: &ConfiguredCamera,
+    session_cookie: &str,
+) -> Result<CaptureSettingsState, String> {
+    let base_url = format!("http://{}:{}", camera.host, camera.port);
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    let (status, body) = run_curl_request(
+        "GET",
+        &format!("{base_url}/brapi/currentproperty"),
+        Some(session_cookie),
+        Some(&referer),
+        None,
+    )?;
+    log_live_view(format!(
+        "capture settings refresh status={status} body_prefix={}",
+        preview_text(&body)
+    ));
+
+    if status != 200 {
+        return Err(format!(
+            "capture settings refresh failed with {status}: {body}"
+        ));
+    }
+
+    parse_capture_settings_state(&body)
+        .ok_or_else(|| "capture settings refresh returned no selectable settings".to_owned())
+}
+
+fn build_capture_settings_cache(
+    camera: &ConfiguredCamera,
+    session_cookie: &str,
+    initial_state: CaptureSettingsState,
+) -> Result<(CaptureSettingsCache, CaptureSettingsState), String> {
+    let mut by_mode = HashMap::new();
+    let original_mode = initial_state.mode.current.clone();
+
+    if !original_mode.is_empty() {
+        by_mode.insert(original_mode.clone(), initial_state.clone());
+    }
+
+    for mode in &initial_state.mode.ability {
+        if mode == &original_mode {
+            continue;
+        }
+
+        update_selectable_camera_setting(camera, session_cookie, "shootingmode", mode)?;
+        let state = fetch_capture_settings_state(camera, session_cookie)?;
+        by_mode.insert(mode.clone(), state);
+    }
+
+    let restored_state = if original_mode.is_empty() {
+        initial_state.clone()
+    } else {
+        update_selectable_camera_setting(camera, session_cookie, "shootingmode", &original_mode)?;
+        fetch_capture_settings_state(camera, session_cookie)?
+    };
+
+    if !restored_state.mode.current.is_empty() {
+        by_mode.insert(restored_state.mode.current.clone(), restored_state.clone());
+    }
+
+    Ok((
+        CaptureSettingsCache {
+            current_mode: restored_state.mode.current.clone(),
+            by_mode,
+        },
+        restored_state,
+    ))
 }
 
 fn logo_picture(bytes: &'static [u8]) -> Picture {
@@ -1367,6 +2107,26 @@ fn logo_icon_textures() -> Vec<gtk::gdk::Texture> {
     .collect()
 }
 
+fn start_starting_animation(logo: &Picture, blink_source: &Rc<RefCell<Option<SourceId>>>) {
+    stop_starting_animation(logo, blink_source);
+
+    let logo = logo.clone();
+    let mut dimmed = false;
+    let source = glib::timeout_add_local(Duration::from_millis(500), move || {
+        dimmed = !dimmed;
+        logo.set_opacity(if dimmed { 0.35 } else { 1.0 });
+        ControlFlow::Continue
+    });
+    *blink_source.borrow_mut() = Some(source);
+}
+
+fn stop_starting_animation(logo: &Picture, blink_source: &Rc<RefCell<Option<SourceId>>>) {
+    if let Some(source) = blink_source.borrow_mut().take() {
+        source.remove();
+    }
+    logo.set_opacity(1.0);
+}
+
 fn set_application_icon(window: &ApplicationWindow) {
     use gtk::gdk::prelude::ToplevelExt;
 
@@ -1386,14 +2146,38 @@ fn set_application_icon(window: &ApplicationWindow) {
 
 fn start_live_view_session(
     configured_camera: ConfiguredCamera,
-    live_view_picture: Picture,
-    status_label: Label,
-    rendered_frame_count: Rc<Cell<u64>>,
-    focus_overlay_state: Rc<RefCell<FocusOverlayState>>,
-    focus_overlay_area: DrawingArea,
-    focus_operation_label: Label,
-    focus_method_label: Label,
+    ui: LiveViewUiBindings,
 ) -> LiveViewSession {
+    let LiveViewUiBindings {
+        live_view_picture,
+        status_label,
+        connect_action,
+        disconnect_action,
+        capture_action,
+        focus_action,
+        content_stack,
+        startup_logo,
+        startup_blink_source,
+        rendered_frame_count,
+        focus_overlay_state,
+        focus_overlay_area,
+        focus_operation_label,
+        focus_method_label,
+        mode_label,
+        mode_dropdown,
+        iso_label,
+        iso_dropdown,
+        shutter_speed_label,
+        shutter_speed_dropdown,
+        aperture_label,
+        aperture_dropdown,
+        mode_dropdown_updating,
+        iso_dropdown_updating,
+        shutter_speed_dropdown_updating,
+        aperture_dropdown_updating,
+        capture_settings_cache,
+    } = ui;
+    let mut startup_complete = false;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
     let stop_ui = stop.clone();
@@ -1413,6 +2197,19 @@ fn start_live_view_session(
                     } else {
                         let rendered = rendered_frame_count.get() + 1;
                         rendered_frame_count.set(rendered);
+                        if !startup_complete {
+                            startup_complete = true;
+                            stop_starting_animation(&startup_logo, &startup_blink_source);
+                            update_connection_state(
+                                ContentViewState::Connected,
+                                &status_label,
+                                &connect_action,
+                                &disconnect_action,
+                                &capture_action,
+                                &focus_action,
+                                &content_stack,
+                            );
+                        }
                         if rendered <= 5 || rendered.is_multiple_of(30) {
                             log_live_view(format!(
                                 "rendered frame #{rendered} ({} bytes)",
@@ -1430,7 +2227,56 @@ fn start_live_view_session(
                     focus_operation_label.set_text(&format!("AF mode: {}", state.operation));
                     focus_method_label.set_text(&format!("AF method: {}", state.method));
                 }
+                LiveViewEvent::CaptureSettings(state) => {
+                    update_selectable_setting_dropdown(
+                        &mode_label,
+                        &mode_dropdown,
+                        &state.mode,
+                        true,
+                        &mode_dropdown_updating,
+                        "shootingmode",
+                    );
+                    update_selectable_setting_dropdown(
+                        &iso_label,
+                        &iso_dropdown,
+                        &state.iso,
+                        true,
+                        &iso_dropdown_updating,
+                        "iso",
+                    );
+                    update_selectable_setting_dropdown(
+                        &shutter_speed_label,
+                        &shutter_speed_dropdown,
+                        &state.shutter_speed,
+                        true,
+                        &shutter_speed_dropdown_updating,
+                        "tv",
+                    );
+                    update_selectable_setting_dropdown(
+                        &aperture_label,
+                        &aperture_dropdown,
+                        &state.aperture,
+                        true,
+                        &aperture_dropdown_updating,
+                        "av",
+                    );
+                }
+                LiveViewEvent::CaptureSettingsCache(cache) => {
+                    *capture_settings_cache.borrow_mut() = Some(cache);
+                }
                 LiveViewEvent::Error(error) => {
+                    if !startup_complete {
+                        stop_starting_animation(&startup_logo, &startup_blink_source);
+                        update_connection_state(
+                            ContentViewState::Disconnected,
+                            &status_label,
+                            &connect_action,
+                            &disconnect_action,
+                            &capture_action,
+                            &focus_action,
+                            &content_stack,
+                        );
+                    }
                     log_live_view(format!("session error: {error}"));
                     status_label.set_text(&format!("Live view error: {error}"));
                 }
@@ -1502,7 +2348,23 @@ async fn run_live_view_session(
         session_cookie.split('=').next().unwrap_or_default()
     ));
 
-    prepare_browser_remote_shooting_page(&base_url, &session_cookie, &sender)?;
+    let initial_capture_settings =
+        prepare_browser_remote_shooting_page(&base_url, &session_cookie, &sender)?;
+    if let Some(initial_capture_settings) = initial_capture_settings {
+        match build_capture_settings_cache(
+            &configured_camera,
+            &session_cookie,
+            initial_capture_settings,
+        ) {
+            Ok((cache, restored_state)) => {
+                let _ = sender.send(LiveViewEvent::CaptureSettingsCache(cache));
+                let _ = sender.send(LiveViewEvent::CaptureSettings(restored_state));
+            }
+            Err(error) => {
+                log_live_view(format!("capture settings cache build failed: {error}"));
+            }
+        }
+    }
     stream_live_view(&base_url, &session_cookie, sender, stop.clone(), child_pid)?;
 
     if !stop.load(Ordering::Relaxed) {
@@ -1579,7 +2441,7 @@ fn prepare_browser_remote_shooting_page(
     base_url: &str,
     session_cookie: &str,
     sender: &mpsc::Sender<LiveViewEvent>,
-) -> Result<(), String> {
+) -> Result<Option<CaptureSettingsState>, String> {
     let (status, body) = run_curl_request(
         "GET",
         &format!("{base_url}/wpd/shoot.shtml"),
@@ -1609,10 +2471,14 @@ fn prepare_browser_remote_shooting_page(
     ));
 
     if status == 200 {
+        let capture_settings = parse_capture_settings_state(&body);
         if let Some(state) = parse_focus_mode_state(&body) {
             let _ = sender.send(LiveViewEvent::FocusMode(state));
         }
-        Ok(())
+        if let Some(state) = capture_settings.clone() {
+            let _ = sender.send(LiveViewEvent::CaptureSettings(state));
+        }
+        Ok(capture_settings)
     } else {
         Err(format!(
             "currentproperty request failed with {status}: {body}"
@@ -1636,6 +2502,72 @@ fn parse_focus_mode_state(body: &str) -> Option<FocusModeState> {
             .unwrap_or("-")
             .to_owned(),
     })
+}
+
+fn parse_capture_settings_state(body: &str) -> Option<CaptureSettingsState> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let state = CaptureSettingsState {
+        mode: parse_selectable_setting_state(&value, "shootingmode"),
+        iso: parse_selectable_setting_state(&value, "iso"),
+        shutter_speed: parse_selectable_setting_state(&value, "tv"),
+        aperture: parse_selectable_setting_state(&value, "av"),
+    };
+
+    (state.mode.is_available()
+        || state.iso.is_available()
+        || state.shutter_speed.is_available()
+        || state.aperture.is_available())
+    .then_some(state)
+}
+
+fn parse_selectable_setting_state(value: &Value, key: &str) -> SelectableSettingState {
+    let current = value
+        .get(key)
+        .and_then(|node| node.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let ability = value
+        .get(key)
+        .and_then(|node| node.get("ability"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+
+    SelectableSettingState { current, ability }
+}
+
+fn update_selectable_camera_setting(
+    camera: &ConfiguredCamera,
+    session_cookie: &str,
+    setting_name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let base_url = format!("http://{}:{}", camera.host, camera.port);
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    let body = format!(r#"{{"value":"{value}"}}"#);
+    let (status, response_body) = run_curl_request(
+        "PUT",
+        &format!("{base_url}/ccapi/ver100/shooting/settings/{setting_name}"),
+        Some(session_cookie),
+        Some(&referer),
+        Some(&body),
+    )?;
+    log_live_view(format!(
+        "setting update status={status} setting={setting_name} value={value} body_prefix={}",
+        preview_text(&response_body)
+    ));
+
+    if status == 200 {
+        Ok(())
+    } else {
+        Err(format!(
+            "setting update failed for `{setting_name}` with {status}: {response_body}"
+        ))
+    }
 }
 
 fn stream_live_view(
@@ -2303,11 +3235,6 @@ fn update_picture_from_frame(picture: &Picture, frame: &[u8]) -> Result<(), glib
     let pixbuf = loader
         .pixbuf()
         .ok_or_else(|| glib::Error::new(glib::FileError::Failed, "missing decoded pixbuf"))?;
-    log_live_view(format!(
-        "decoded JPEG into pixbuf {}x{}",
-        pixbuf.width(),
-        pixbuf.height()
-    ));
     picture.set_pixbuf(Some(&pixbuf));
     Ok(())
 }
