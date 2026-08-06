@@ -59,7 +59,7 @@ dnf install git rust rust-std-static cargo rustfmt clippy
 3. Open the MSYS2 Blue terminal (not yellow or purple) and install the necessary dependencies.
 
 ```bash
-pacman -S mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libgphoto2 mingw-w64-x86_64-clang mingw-w64-x86_64-gtk4
+pacman -S mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libgphoto2 mingw-w64-x86_64-clang mingw-w64-x86_64-gtk4 mingw-w64-x86_64-gstreamer mingw-w64-x86_64-gst-plugins-base mingw-w64-x86_64-gst-plugins-good mingw-w64-x86_64-gst-plugins-bad mingw-w64-x86_64-gcc-libs
 
 ```
 
