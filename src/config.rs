@@ -267,7 +267,9 @@ fn optional_value(ini: &Ini, section: &str, key: &str) -> Option<String> {
 }
 
 fn current_home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn config_search_paths(home_dir: Option<&Path>) -> Vec<PathBuf> {
