@@ -17,6 +17,8 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 
+use rpassword::prompt_password as read_password;
+
 use crate::config::{self, ConfiguredCamera};
 use crate::network::{self, NetworkCamera};
 
@@ -66,7 +68,7 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
 
     configured_camera.username = prompt_optional("Username")?;
     configured_camera.password = match configured_camera.username.as_deref() {
-        Some(_) => Some(prompt_required("Password")?),
+        Some(_) => Some(prompt_password("Password")?),
         None => None,
     };
 
@@ -136,6 +138,16 @@ fn prompt_port(default: u16) -> io::Result<u16> {
             Ok(port) => return Ok(port),
             Err(_) => println!("Enter a valid port number."),
         }
+    }
+}
+
+fn prompt_password(label: &str) -> io::Result<String> {
+    loop {
+        let pass = read_password(format!("{label}: "))?;
+        if !pass.trim().is_empty() {
+            return Ok(pass);
+        }
+        println!("Password cannot be empty when username is set.");
     }
 }
 
