@@ -2562,9 +2562,7 @@ fn stop_live_view_transport(base_url: &str, session_cookie: &str) -> Result<(), 
         preview_text(&body)
     ));
 
-    if matches!(status, 200 | 204) {
-        Ok(())
-    } else if status == 503 && body.contains("Already stopped") {
+    if matches!(status, 200 | 204) || (status == 503 && body.contains("Already stopped")) {
         Ok(())
     } else {
         Err(format!(
