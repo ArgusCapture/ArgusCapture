@@ -96,8 +96,9 @@ That page displays:
 
 > A user with the same login name is already accessing the camera
 
-In practice, calling `/brapi/logout` before logging in is useful when
-reverse-engineering or automating the interface.
+In practice, the safest automation pattern is to try login first, and only if
+the camera answers with `/wpd/already_login.shtml`, run the Browser Remote
+logout flow and retry.
 
 ## Browser Remote page map
 

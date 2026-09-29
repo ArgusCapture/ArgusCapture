@@ -47,9 +47,9 @@ Required inputs come from the selected camera in `argus-capture.conf`:
 
 Current login/session model in `src/gui.rs`:
 
-1. `GET /brapi/logout`
-2. Digest-auth `GET /brapi/login`
-3. capture `brsessionid=...` from `Set-Cookie`
+1. Digest-auth `GET /brapi/login`
+2. if login lands on `/wpd/already_login.shtml`, force a Browser Remote logout reset
+3. retry login and capture `brsessionid=...` from `Set-Cookie`
 4. `GET /wpd/shoot.shtml`
 5. `GET /brapi/currentproperty`
 6. live control requests carry:
@@ -75,7 +75,7 @@ proves it unnecessary.
 
 | Endpoint | Method | Current Argus Capture status | Notes |
 | --- | --- | --- | --- |
-| `/brapi/logout` | `GET` | implemented | clears stale Browser Remote session before login |
+| `/brapi/logout` | `GET` | implemented | force-reset path for stale sessions, followed via redirect to the Browser Remote logout page |
 | `/brapi/login` | `GET` + Digest auth | implemented | returns `brsessionid` cookie on success |
 | `/wpd/shoot.shtml` | `GET` | implemented | prepares the shooting page state |
 | `/brapi/currentproperty` | `GET` | implemented | seeds AF mode / method and other shooting state |
@@ -86,8 +86,19 @@ proves it unnecessary.
 | `/ccapi/ver100/shooting/control/shutterbutton/manual` | `POST` | documented fallback | Browser Remote JS uses manual half/full/release sequence |
 | `/ccapi/ver100/shooting/control/moviemode` | `POST` | next for video | switch still/movie mode |
 | `/ccapi/ver100/shooting/control/recbutton` | `POST` | next for video | start / stop recording |
-| `/ccapi/ver100/shooting/liveview` | `POST` | documented but not used by current code | Browser Remote uses this as a live-view control endpoint |
+| `/ccapi/ver100/shooting/liveview` | `POST` | implemented for live-view recovery | used when the stream needs nudging back on after setting changes or blank-frame streaks |
 | `/ccapi/ver100/event/polling?continue=on` | `GET` | implemented for storage policy | used to detect newly added camera content after capture |
+
+When the camera is still finishing a prior capture or image-review cycle, some
+Browser Remote and CCAPI endpoints respond with `503 {"message":"During shooting or recording"}`.
+Argus Capture now treats that as a temporary busy state during connect: it
+avoids eager shooting-mode warm-up and keeps retrying instead of failing the
+session immediately.
+
+The Browser Remote transport itself is also single-session. Before opening
+`/brapi/shooting/lvscrolldetail?liveviewsize=medium`, Argus Capture now sends
+`DELETE /brapi/shooting/lvscrolldetail?liveviewsize=off` to clear any stale
+transport that would otherwise answer with `503 {"message":"Already started"}`.
 | `/ccapi/.../contents/...` | `GET` | implemented for storage policy | download captured file bytes using the content path returned by event polling |
 | `/ccapi/.../contents/...` | `DELETE` | implemented for storage policy | remove camera copy after download when storage mode is `workspace_only` |
 
@@ -100,6 +111,7 @@ proves it unnecessary.
 | Live view stream | `stream_live_view` | `/brapi/shooting/lvscrolldetail?liveviewsize=medium` |
 | Focus button | `trigger_focus` | `/ccapi/ver100/shooting/control/af` |
 | Focus-point arrows | `move_focus_point` | `/ccapi/ver100/shooting/liveview/afframeposition` |
+| Live-view click-to-focus | `move_focus_point` + `trigger_focus` | `/ccapi/ver100/shooting/liveview/afframeposition`, `/ccapi/ver100/shooting/control/af` |
 | Take Picture button | `trigger_picture_capture` | `/ccapi/ver100/shooting/control/shutterbutton` |
 | Storage policy follow-up | `apply_storage_policy_to_capture` | `/ccapi/ver100/event/polling?continue=on`, `/ccapi/.../contents/...` |
 

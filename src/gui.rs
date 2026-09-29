@@ -34,13 +34,14 @@ use gtk::glib::{self, ControlFlow, SourceId};
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, Dialog, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, Grid, Label, Orientation, Overlay, Picture,
-    PopoverMenuBar, ResponseType, SpinButton, Stack, StackSwitcher, StringList, Switch,
+    Entry, FileChooserAction, FileChooserNative, GestureClick, Grid, Label, Orientation, Overlay,
+    Picture, PopoverMenuBar, ResponseType, SpinButton, Stack, StackSwitcher, StringList, Switch,
 };
 use serde_json::Value;
 use tokio::runtime::Builder;
 
 use crate::config::{self, AppConfig, ConfiguredCamera, StorageMode};
+use crate::network::{self, NetworkCamera};
 
 const APP_ID: &str = "org.arguscapture.ArgusCapture";
 const APP_NAME: &str = "Argus Capture";
@@ -57,6 +58,7 @@ struct LiveViewSession {
     stop: Arc<AtomicBool>,
     child_pid: Arc<Mutex<Option<u32>>>,
     session_cookie: Arc<Mutex<Option<String>>>,
+    pending_added_contents: Arc<Mutex<Vec<String>>>,
     ui_source: SourceId,
     worker: thread::JoinHandle<()>,
 }
@@ -82,6 +84,7 @@ struct LiveViewUiBindings {
     iso_dropdown: DropDown,
     shutter_speed_label: Label,
     shutter_speed_dropdown: DropDown,
+    current_shutter_speed_display: Label,
     aperture_label: Label,
     aperture_dropdown: DropDown,
     mode_dropdown_updating: Rc<Cell<bool>>,
@@ -99,6 +102,7 @@ struct CaptureSettingsControls {
     iso_dropdown: DropDown,
     shutter_speed_label: Label,
     shutter_speed_dropdown: DropDown,
+    current_shutter_speed_display: Label,
     aperture_label: Label,
     aperture_dropdown: DropDown,
     mode_dropdown_updating: Rc<Cell<bool>>,
@@ -119,6 +123,10 @@ enum LiveViewEvent {
     FocusMode(FocusModeState),
     CaptureSettings(CaptureSettingsState),
     CaptureSettingsCache(CaptureSettingsCache),
+    EffectiveExposure {
+        shutter_speed: Option<String>,
+        aperture: Option<String>,
+    },
     Error(String),
 }
 
@@ -147,6 +155,7 @@ struct ConnectedView {
     iso_dropdown: DropDown,
     shutter_speed_label: Label,
     shutter_speed_dropdown: DropDown,
+    current_shutter_speed_display: Label,
     aperture_label: Label,
     aperture_dropdown: DropDown,
 }
@@ -188,6 +197,48 @@ struct CaptureSettingsState {
     iso: SelectableSettingState,
     shutter_speed: SelectableSettingState,
     aperture: SelectableSettingState,
+    // Camera-metered values (`effective_value_tv` / `effective_value_av`);
+    // these are the only exposure values the camera reports for parameters it
+    // estimates itself (shutter speed in P/Av/auto, aperture in P/Tv/auto).
+    effective_shutter_speed: String,
+    effective_aperture: String,
+}
+
+impl CaptureSettingsState {
+    fn display_shutter_speed(&self) -> &str {
+        let selected = self.shutter_speed.current.trim();
+        if selected.is_empty() {
+            self.effective_shutter_speed.trim()
+        } else {
+            selected
+        }
+    }
+
+    fn display_aperture(&self) -> &str {
+        let selected = self.aperture.current.trim();
+        let aperture = if selected.is_empty() {
+            self.effective_aperture.trim()
+        } else {
+            selected
+        };
+        aperture.strip_prefix('f').unwrap_or(aperture)
+    }
+
+    // Exposure summary for the shutter speed panel, e.g. "2.0 1/640".
+    fn display_exposure(&self) -> String {
+        let aperture = self.display_aperture();
+        let shutter_speed = self.display_shutter_speed();
+        match (aperture.is_empty(), shutter_speed.is_empty()) {
+            (false, false) => format!("{aperture} {shutter_speed}"),
+            (true, false) => shutter_speed.to_owned(),
+            (false, true) => aperture.to_owned(),
+            (true, true) => String::new(),
+        }
+    }
+
+    fn has_complete_exposure(&self) -> bool {
+        !self.display_shutter_speed().is_empty() && !self.display_aperture().is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,6 +271,40 @@ enum ContentViewState {
 enum CapturedMediaKind {
     Picture,
     Video,
+}
+
+struct CaptureOutcome {
+    status_message: String,
+    path_labels: Vec<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum BrowserRemoteLoginError {
+    MissingCredentials,
+    Curl(String),
+    AlreadyInUse,
+    UnexpectedLandingPage(String),
+    MissingSessionCookie,
+}
+
+impl BrowserRemoteLoginError {
+    fn into_message(self) -> String {
+        match self {
+            Self::MissingCredentials => "Browser Remote requires username and password".to_owned(),
+            Self::Curl(message) => message,
+            Self::AlreadyInUse => "Browser Remote is already in use".to_owned(),
+            Self::UnexpectedLandingPage(location) => {
+                format!("unexpected Browser Remote landing page `{location}`")
+            }
+            Self::MissingSessionCookie => "missing Browser Remote session cookie".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveViewEnableOutcome {
+    Enabled,
+    Busy,
 }
 
 pub(crate) fn run(config: Option<&AppConfig>) {
@@ -301,6 +386,7 @@ fn build_ui(
         iso_dropdown: connected_view.iso_dropdown.clone(),
         shutter_speed_label: connected_view.shutter_speed_label.clone(),
         shutter_speed_dropdown: connected_view.shutter_speed_dropdown.clone(),
+        current_shutter_speed_display: connected_view.current_shutter_speed_display.clone(),
         aperture_label: connected_view.aperture_label.clone(),
         aperture_dropdown: connected_view.aperture_dropdown.clone(),
         mode_dropdown_updating: mode_dropdown_updating.clone(),
@@ -361,6 +447,7 @@ fn build_ui(
         let iso_dropdown = connected_view.iso_dropdown.clone();
         let shutter_speed_label = connected_view.shutter_speed_label.clone();
         let shutter_speed_dropdown = connected_view.shutter_speed_dropdown.clone();
+        let current_shutter_speed_display = connected_view.current_shutter_speed_display.clone();
         let aperture_label = connected_view.aperture_label.clone();
         let aperture_dropdown = connected_view.aperture_dropdown.clone();
         let live_view_session = live_view_session.clone();
@@ -444,6 +531,7 @@ fn build_ui(
                     iso_dropdown: iso_dropdown.clone(),
                     shutter_speed_label: shutter_speed_label.clone(),
                     shutter_speed_dropdown: shutter_speed_dropdown.clone(),
+                    current_shutter_speed_display: current_shutter_speed_display.clone(),
                     aperture_label: aperture_label.clone(),
                     aperture_dropdown: aperture_dropdown.clone(),
                     mode_dropdown_updating: mode_dropdown_updating.clone(),
@@ -501,8 +589,14 @@ fn build_ui(
             connected.set(false);
             video_recording.set(false);
             *capture_settings_cache.borrow_mut() = None;
+            let camera = configured_camera.borrow().clone();
             if let Some(session) = live_view_session.borrow_mut().take() {
                 session.stop.store(true, Ordering::Relaxed);
+                let session_cookie = session
+                    .session_cookie
+                    .lock()
+                    .ok()
+                    .and_then(|cookie| cookie.clone());
                 if let Ok(pid_slot) = session.child_pid.lock()
                     && let Some(pid) = *pid_slot
                 {
@@ -516,16 +610,13 @@ fn build_ui(
                 }
                 session.ui_source.remove();
                 let _ = session.worker.join();
-            }
-            let camera = configured_camera.borrow().clone();
-            if !camera.host.trim().is_empty() {
-                let _ = run_curl_request(
-                    "GET",
-                    &format!("http://{}:{}/brapi/logout", camera.host, camera.port),
-                    None,
-                    None,
-                    None,
-                );
+                if !camera.host.trim().is_empty() {
+                    let base_url = format!("http://{}:{}", camera.host, camera.port);
+                    if let Some(session_cookie) = session_cookie.as_deref() {
+                        let _ = stop_live_view_transport(&base_url, session_cookie);
+                    }
+                    let _ = logout_browser_remote(&base_url, &camera, session_cookie.as_deref());
+                }
             }
             rendered_frame_count.set(0);
             live_view_picture.set_paintable(Option::<&gtk::gdk::Texture>::None);
@@ -587,6 +678,7 @@ fn build_ui(
     }
 
     {
+        let window = window.clone();
         let status_label = status_label.clone();
         let live_view_session = live_view_session.clone();
         let configured_camera = configured_camera.clone();
@@ -601,10 +693,20 @@ fn build_ui(
         let video_recording = video_recording.clone();
         capture_action.clone().connect_activate(move |_, _| {
             let camera = configured_camera.borrow().clone();
-            let cookie = live_view_session
-                .borrow()
-                .as_ref()
-                .and_then(|session| session.session_cookie.lock().ok()?.clone());
+            let (cookie, pending_added_contents) = {
+                let session = live_view_session.borrow();
+                match session.as_ref() {
+                    Some(session) => (
+                        session
+                            .session_cookie
+                            .lock()
+                            .ok()
+                            .and_then(|cookie| cookie.clone()),
+                        Some(session.pending_added_contents.clone()),
+                    ),
+                    None => (None, None),
+                }
+            };
 
             let Some(cookie) = cookie else {
                 status_label.set_text(if capture_mode.get() == CaptureMode::Picture {
@@ -614,9 +716,14 @@ fn build_ui(
                 });
                 return;
             };
+            let Some(pending_added_contents) = pending_added_contents else {
+                status_label.set_text("Capture unavailable: no active camera session.");
+                return;
+            };
 
             match capture_mode.get() {
                 CaptureMode::Picture => {
+                    clear_pending_added_contents(&pending_added_contents);
                     log_live_view(format!(
                         "picture capture requested for {}:{}",
                         camera.host, camera.port
@@ -626,23 +733,30 @@ fn build_ui(
                     match trigger_picture_capture(&camera, &cookie) {
                         Ok(()) => {
                             let storage_mode = storage.get();
-                            if storage_mode != StorageMode::CameraOnly {
-                                disconnect_action.set_enabled(false);
-                                status_label.set_text("Downloading...");
-                                flush_main_context();
-                            }
+                            disconnect_action.set_enabled(false);
+                            status_label.set_text(match storage_mode {
+                                StorageMode::CameraOnly => "Finalizing picture...",
+                                _ => "Downloading...",
+                            });
+                            flush_main_context();
                             let result = apply_storage_policy_to_capture(
                                 &camera,
                                 &cookie,
                                 &workspace.borrow(),
                                 storage_mode,
                                 CapturedMediaKind::Picture,
+                                &pending_added_contents,
                             );
-                            if storage_mode != StorageMode::CameraOnly {
-                                disconnect_action.set_enabled(connected.get());
-                            }
+                            disconnect_action.set_enabled(connected.get());
                             match result {
-                                Ok(message) => status_label.set_text(&message),
+                                Ok(outcome) => {
+                                    status_label.set_text(&outcome.status_message);
+                                    present_capture_result_dialog(
+                                        &window,
+                                        CapturedMediaKind::Picture,
+                                        &outcome.path_labels,
+                                    );
+                                }
                                 Err(error) => {
                                     log_live_view(format!(
                                         "picture storage handling failed: {error}"
@@ -661,6 +775,7 @@ fn build_ui(
                 }
                 CaptureMode::Video => {
                     if video_recording.get() {
+                        clear_pending_added_contents(&pending_added_contents);
                         log_live_view(format!(
                             "video stop requested for {}:{}",
                             camera.host, camera.port
@@ -679,20 +794,30 @@ fn build_ui(
                                     &capture_mode_switch,
                                 );
                                 let storage_mode = storage.get();
-                                if storage_mode != StorageMode::CameraOnly {
-                                    status_label.set_text("Downloading...");
-                                    flush_main_context();
-                                }
+                                disconnect_action.set_enabled(false);
+                                status_label.set_text(match storage_mode {
+                                    StorageMode::CameraOnly => "Finalizing video...",
+                                    _ => "Downloading...",
+                                });
+                                flush_main_context();
                                 let result = apply_storage_policy_to_capture(
                                     &camera,
                                     &cookie,
                                     &workspace.borrow(),
                                     storage_mode,
                                     CapturedMediaKind::Video,
+                                    &pending_added_contents,
                                 );
                                 disconnect_action.set_enabled(connected.get());
                                 match result {
-                                    Ok(message) => status_label.set_text(&message),
+                                    Ok(outcome) => {
+                                        status_label.set_text(&outcome.status_message);
+                                        present_capture_result_dialog(
+                                            &window,
+                                            CapturedMediaKind::Video,
+                                            &outcome.path_labels,
+                                        );
+                                    }
                                     Err(error) => {
                                         log_live_view(format!(
                                             "video storage handling failed: {error}"
@@ -709,6 +834,7 @@ fn build_ui(
                             }
                         }
                     } else {
+                        clear_pending_added_contents(&pending_added_contents);
                         log_live_view(format!(
                             "video capture requested for {}:{}",
                             camera.host, camera.port
@@ -1088,6 +1214,88 @@ fn build_ui(
     }
 
     {
+        let status_label = status_label.clone();
+        let configured_camera = configured_camera.clone();
+        let live_view_session = live_view_session.clone();
+        let focus_overlay_state = focus_overlay_state.clone();
+        let focus_overlay_area = connected_view.focus_overlay_area.clone();
+        let focus_overlay_area_for_handler = focus_overlay_area.clone();
+        let focus_overlay_area_for_redraw = focus_overlay_area.clone();
+        let click = GestureClick::new();
+        click.set_button(1);
+        click.connect_pressed(move |_, n_press, x, y| {
+            if n_press != 1 {
+                return;
+            }
+
+            let camera = configured_camera.borrow().clone();
+            let cookie = live_view_session
+                .borrow()
+                .as_ref()
+                .and_then(|session| session.session_cookie.lock().ok()?.clone());
+
+            let Some(cookie) = cookie else {
+                status_label.set_text("Focus point unavailable: no active camera session.");
+                return;
+            };
+
+            let new_state = {
+                let current = focus_overlay_state.borrow().clone();
+                match focus_overlay_state_from_click(
+                    &current,
+                    focus_overlay_area_for_handler.allocated_width() as f64,
+                    focus_overlay_area_for_handler.allocated_height() as f64,
+                    x,
+                    y,
+                ) {
+                    Ok(state) => state,
+                    Err(message) => {
+                        status_label.set_text(message);
+                        return;
+                    }
+                }
+            };
+
+            log_live_view(format!(
+                "focus point click requested target=({}, {}) click=({x:.1}, {y:.1})",
+                focus_target_x(&new_state),
+                focus_target_y(&new_state)
+            ));
+
+            status_label.set_text("Moving focus point...");
+            flush_main_context();
+
+            match move_focus_point(&camera, &cookie, &new_state) {
+                Ok(()) => {
+                    *focus_overlay_state.borrow_mut() = new_state;
+                    focus_overlay_area_for_redraw.queue_draw();
+                }
+                Err(error) => {
+                    log_live_view(format!("focus point move failed: {error}"));
+                    status_label.set_text(&format!("Focus point error: {error}"));
+                    return;
+                }
+            }
+
+            log_live_view(format!(
+                "focus requested after click for {}:{}",
+                camera.host, camera.port
+            ));
+            status_label.set_text("Focusing...");
+            flush_main_context();
+
+            match trigger_focus(&camera, &cookie) {
+                Ok(()) => status_label.set_text("Focus complete."),
+                Err(error) => {
+                    log_live_view(format!("focus failed after click: {error}"));
+                    status_label.set_text(&format!("Focus error: {error}"));
+                }
+            }
+        });
+        focus_overlay_area.add_controller(click);
+    }
+
+    {
         let configured_camera = configured_camera.clone();
         let workspace = workspace.clone();
         let storage = storage.clone();
@@ -1344,6 +1552,14 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
     iso_dropdown.set_sensitive(false);
     shutter_speed_dropdown.set_sensitive(false);
     aperture_dropdown.set_sensitive(false);
+    let current_shutter_speed_display = Label::new(None);
+    current_shutter_speed_display.set_hexpand(true);
+    current_shutter_speed_display.set_halign(Align::Fill);
+    current_shutter_speed_display.set_justify(gtk::Justification::Center);
+    current_shutter_speed_display.set_xalign(0.5);
+    current_shutter_speed_display.add_css_class("title-1");
+    let shutter_speed_display_spacer = GtkBox::new(Orientation::Vertical, 0);
+    shutter_speed_display_spacer.set_vexpand(true);
     settings_grid.attach(&mode_label, 0, 0, 1, 1);
     settings_grid.attach(&mode_dropdown, 1, 0, 1, 1);
     settings_grid.attach(&iso_label, 0, 1, 1, 1);
@@ -1362,6 +1578,8 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
     side_panel.append(&focus_grid);
     side_panel.append(&exposure_title);
     side_panel.append(&settings_grid);
+    side_panel.append(&shutter_speed_display_spacer);
+    side_panel.append(&current_shutter_speed_display);
 
     connected.append(&live_view_overlay);
     connected.append(&side_panel);
@@ -1395,6 +1613,7 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
         iso_dropdown,
         shutter_speed_label,
         shutter_speed_dropdown,
+        current_shutter_speed_display,
         aperture_label,
         aperture_dropdown,
     }
@@ -1417,7 +1636,7 @@ fn present_configuration_dialog(
         .modal(true)
         .resizable(false)
         .build();
-    dialog.set_default_size(680, 320);
+    dialog.set_default_size(680, 420);
     let cancel_button = dialog.add_button("Cancel", ResponseType::Cancel);
     let save_button = dialog.add_button("Save", ResponseType::Accept);
     for button in [&cancel_button, &save_button] {
@@ -1484,12 +1703,32 @@ fn present_configuration_dialog(
         .hexpand(true)
         .visibility(false)
         .build();
+    let scan_mask_entry = Entry::builder()
+        .text(default_camera_scan_mask(&current.host))
+        .placeholder_text("192.168.1.xxx")
+        .hexpand(true)
+        .build();
+    let scan_button = Button::with_label("Scan");
+    let scan_controls = GtkBox::new(Orientation::Horizontal, 6);
+    scan_controls.append(&scan_mask_entry);
+    scan_controls.append(&scan_button);
+    let scanned_camera_dropdown = DropDown::from_strings(&["No scanned Canon cameras"]);
+    scanned_camera_dropdown.set_sensitive(false);
+    let scan_status_label = Label::new(Some(
+        "Enter a network mask like 192.168.1.xxx to scan for Canon cameras.",
+    ));
+    scan_status_label.set_halign(Align::Start);
+    scan_status_label.set_wrap(true);
+    let scanned_cameras = Rc::new(RefCell::new(Vec::<NetworkCamera>::new()));
 
     attach_form_row(&grid, 0, "Camera", &camera_name_entry);
     attach_form_row(&grid, 1, "Host", &host_entry);
     attach_form_row(&grid, 2, "Port", &port_spin);
     attach_form_row(&grid, 3, "Username", &username_entry);
     attach_form_row(&grid, 4, "Password", &password_entry);
+    attach_form_row(&grid, 5, "Scan mask", &scan_controls);
+    attach_form_row(&grid, 6, "Detected", &scanned_camera_dropdown);
+    grid.attach(&scan_status_label, 1, 7, 1, 1);
 
     let camera_page = GtkBox::new(Orientation::Vertical, 0);
     camera_page.set_margin_top(12);
@@ -1531,6 +1770,106 @@ fn present_configuration_dialog(
                 chooser.hide();
             });
             chooser.show();
+        });
+    }
+
+    {
+        let scanned_cameras = scanned_cameras.clone();
+        let camera_name_entry = camera_name_entry.clone();
+        let host_entry = host_entry.clone();
+        let port_spin = port_spin.clone();
+        scanned_camera_dropdown.connect_selected_notify(move |dropdown| {
+            let selected_index = dropdown.selected() as usize;
+            let selected_camera = scanned_cameras.borrow().get(selected_index).cloned();
+            if let Some(camera) = selected_camera {
+                camera_name_entry.set_text(&network::suggest_camera_name(Some(&camera)));
+                host_entry.set_text(&camera.address);
+                port_spin.set_value(camera.port as f64);
+            }
+        });
+    }
+
+    {
+        let scan_button = scan_button.clone();
+        let scan_mask_entry = scan_mask_entry.clone();
+        let scanned_camera_dropdown = scanned_camera_dropdown.clone();
+        let scan_status_label = scan_status_label.clone();
+        let scanned_cameras = scanned_cameras.clone();
+        let host_entry = host_entry.clone();
+        scan_button.clone().connect_clicked(move |_| {
+            let mask = scan_mask_entry.text().trim().to_owned();
+            if mask.is_empty() {
+                scan_status_label.set_text("Enter a network mask like 192.168.1.xxx.");
+                return;
+            }
+
+            scan_button.set_sensitive(false);
+            scanned_camera_dropdown.set_sensitive(false);
+            scan_status_label.set_text(&format!("Scanning {mask} for Canon cameras..."));
+            flush_main_context();
+
+            let (sender, receiver) = mpsc::channel::<Result<Vec<NetworkCamera>, String>>();
+            let worker_mask = mask.clone();
+            thread::spawn(move || {
+                let result = Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("Failed to start scan worker: {error}"))
+                    .and_then(|runtime| {
+                        runtime.block_on(network::discover_canon_cameras_in_mask(&worker_mask))
+                    });
+                let _ = sender.send(result);
+            });
+
+            let scan_button = scan_button.clone();
+            let scanned_camera_dropdown = scanned_camera_dropdown.clone();
+            let scan_status_label = scan_status_label.clone();
+            let scanned_cameras = scanned_cameras.clone();
+            let host_entry = host_entry.clone();
+            let _ = glib::timeout_add_local(Duration::from_millis(33), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(cameras)) => {
+                        let preferred_host = host_entry.text().trim().to_owned();
+                        scan_button.set_sensitive(true);
+                        *scanned_cameras.borrow_mut() = cameras;
+                        update_scanned_camera_dropdown(
+                            &scanned_camera_dropdown,
+                            &scanned_cameras.borrow(),
+                            &preferred_host,
+                        );
+
+                        let camera_count = scanned_cameras.borrow().len();
+                        if camera_count == 0 {
+                            scan_status_label
+                                .set_text(&format!("No Canon cameras found for {mask}."));
+                        } else {
+                            let plural = if camera_count == 1 { "" } else { "s" };
+                            scan_status_label.set_text(&format!(
+                                "Found {camera_count} Canon camera{plural} in {mask}."
+                            ));
+                        }
+
+                        ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        scan_button.set_sensitive(true);
+                        scanned_cameras.borrow_mut().clear();
+                        update_scanned_camera_dropdown(
+                            &scanned_camera_dropdown,
+                            &[],
+                            host_entry.text().trim(),
+                        );
+                        scan_status_label.set_text(&format!("Scan failed: {error}"));
+                        ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        scan_button.set_sensitive(true);
+                        scan_status_label.set_text("Scan failed: scan worker stopped.");
+                        ControlFlow::Break
+                    }
+                }
+            });
         });
     }
 
@@ -1638,6 +1977,66 @@ fn present_about_dialog(parent: &ApplicationWindow) {
     dialog.present();
 }
 
+fn present_capture_result_dialog(
+    parent: &ApplicationWindow,
+    media_kind: CapturedMediaKind,
+    path_labels: &[String],
+) {
+    if path_labels.is_empty() {
+        return;
+    }
+
+    let singular = path_labels.len() == 1;
+    let noun = match media_kind {
+        CapturedMediaKind::Picture => {
+            if singular {
+                "Picture path"
+            } else {
+                "Picture paths"
+            }
+        }
+        CapturedMediaKind::Video => {
+            if singular {
+                "Video path"
+            } else {
+                "Video paths"
+            }
+        }
+    };
+
+    let dialog = Dialog::builder()
+        .title(noun)
+        .transient_for(parent)
+        .modal(true)
+        .resizable(false)
+        .build();
+    dialog.add_button("Close", ResponseType::Close);
+
+    let content_area = dialog.content_area();
+    content_area.set_spacing(12);
+    content_area.set_margin_top(16);
+    content_area.set_margin_bottom(16);
+    content_area.set_margin_start(24);
+    content_area.set_margin_end(24);
+
+    let summary = Label::new(Some("Capture completed:"));
+    summary.set_halign(Align::Start);
+
+    let paths_label = Label::new(Some(&path_labels.join("\n")));
+    paths_label.set_halign(Align::Start);
+    paths_label.set_xalign(0.0);
+    paths_label.set_wrap(true);
+    paths_label.set_selectable(true);
+
+    content_area.append(&summary);
+    content_area.append(&paths_label);
+
+    dialog.connect_response(|dialog, _| {
+        dialog.close();
+    });
+    dialog.present();
+}
+
 fn attach_form_row<W: IsA<gtk::Widget>>(grid: &Grid, row: i32, label: &str, widget: &W) {
     let label = Label::builder().label(label).halign(Align::End).build();
     grid.attach(&label, 0, row, 1, 1);
@@ -1648,6 +2047,55 @@ fn optional_entry_text(entry: &Entry) -> Option<String> {
     let text = entry.text();
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn default_camera_scan_mask(host: &str) -> String {
+    let mut octets = host.trim().split('.');
+    let (Some(first), Some(second), Some(third), Some(fourth)) =
+        (octets.next(), octets.next(), octets.next(), octets.next())
+    else {
+        return String::new();
+    };
+
+    if octets.next().is_some() {
+        return String::new();
+    }
+
+    for octet in [first, second, third, fourth] {
+        if octet.parse::<u8>().is_err() {
+            return String::new();
+        }
+    }
+
+    format!("{first}.{second}.{third}.xxx")
+}
+
+fn update_scanned_camera_dropdown(
+    dropdown: &DropDown,
+    cameras: &[NetworkCamera],
+    preferred_host: &str,
+) {
+    let model = StringList::new(&[]);
+
+    if cameras.is_empty() {
+        model.append("No scanned Canon cameras");
+        dropdown.set_model(Some(&model));
+        dropdown.set_selected(0);
+        dropdown.set_sensitive(false);
+        return;
+    }
+
+    for camera in cameras {
+        model.append(&format!("{} ({})", camera.display_name(), camera.address));
+    }
+
+    dropdown.set_model(Some(&model));
+    let selected_index = cameras
+        .iter()
+        .position(|camera| camera.address == preferred_host)
+        .unwrap_or(0) as u32;
+    dropdown.set_selected(selected_index);
+    dropdown.set_sensitive(true);
 }
 
 fn save_configuration(
@@ -1896,6 +2344,10 @@ fn update_capture_settings_controls(
         &controls.aperture_dropdown_updating,
         "av",
     );
+    update_current_shutter_speed_display(
+        &controls.current_shutter_speed_display,
+        &state.display_exposure(),
+    );
 }
 
 fn set_capture_settings_controls_sensitive(controls: &CaptureSettingsControls, sensitive: bool) {
@@ -1905,8 +2357,18 @@ fn set_capture_settings_controls_sensitive(controls: &CaptureSettingsControls, s
     controls.iso_dropdown.set_sensitive(sensitive);
     controls.shutter_speed_label.set_sensitive(sensitive);
     controls.shutter_speed_dropdown.set_sensitive(sensitive);
+    controls
+        .current_shutter_speed_display
+        .set_sensitive(sensitive);
     controls.aperture_label.set_sensitive(sensitive);
     controls.aperture_dropdown.set_sensitive(sensitive);
+}
+
+fn update_current_shutter_speed_display(display: &Label, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        display.set_text(value);
+    }
 }
 
 fn apply_cached_selectable_setting_change(
@@ -1933,6 +2395,23 @@ fn apply_cached_selectable_setting_change(
     Some(state.clone())
 }
 
+fn apply_refreshed_capture_settings_state(
+    capture_settings_cache: &Rc<RefCell<Option<CaptureSettingsCache>>>,
+    state: &CaptureSettingsState,
+) {
+    let mut cache_ref = capture_settings_cache.borrow_mut();
+    let Some(cache) = cache_ref.as_mut() else {
+        return;
+    };
+
+    if !state.mode.current.is_empty() {
+        cache.current_mode = state.mode.current.clone();
+        cache
+            .by_mode
+            .insert(state.mode.current.clone(), state.clone());
+    }
+}
+
 fn apply_selectable_setting_change_async(
     camera: ConfiguredCamera,
     session_cookie: String,
@@ -1952,24 +2431,48 @@ fn apply_selectable_setting_change_async(
     let capture_settings_cache = capture_settings_cache.clone();
     let status_label = status_label.clone();
     let worker_value = value.clone();
-    let (sender, receiver) = mpsc::channel::<Result<(), String>>();
+    let (sender, receiver) = mpsc::channel::<(Result<(), String>, Option<CaptureSettingsState>)>();
 
     thread::spawn(move || {
         let update_result =
             update_selectable_camera_setting(&camera, &session_cookie, setting_name, &worker_value);
-        let _ = sender.send(update_result);
+        let refreshed_state = if update_result.is_ok() {
+            let state = refresh_capture_settings_state_after_change(&camera, &session_cookie).ok();
+            // The camera stops rendering live view a moment after applying
+            // some setting changes (the stream keeps delivering blank frames);
+            // turn it back on once the change has settled.
+            let base_url = format!("http://{}:{}", camera.host, camera.port);
+            match enable_live_view(&base_url, &session_cookie) {
+                Ok(LiveViewEnableOutcome::Enabled | LiveViewEnableOutcome::Busy) => {}
+                Err(error) => log_live_view(format!("live view enable failed: {error}")),
+            }
+            state
+        } else {
+            None
+        };
+        let _ = sender.send((update_result, refreshed_state));
     });
 
     let _ = glib::timeout_add_local(Duration::from_millis(33), move || {
         match receiver.try_recv() {
-            Ok(result) => {
+            Ok((result, refreshed_state)) => {
                 match result {
                     Ok(()) => {
-                        if let Some(state) = apply_cached_selectable_setting_change(
-                            &capture_settings_cache,
-                            setting_name,
-                            &value,
-                        ) {
+                        let state = if let Some(refreshed_state) = refreshed_state {
+                            apply_refreshed_capture_settings_state(
+                                &capture_settings_cache,
+                                &refreshed_state,
+                            );
+                            Some(refreshed_state)
+                        } else {
+                            apply_cached_selectable_setting_change(
+                                &capture_settings_cache,
+                                setting_name,
+                                &value,
+                            )
+                        };
+
+                        if let Some(state) = state {
                             update_capture_settings_controls(&controls, &state, true);
                         } else {
                             set_capture_settings_controls_sensitive(&controls, true);
@@ -2022,46 +2525,119 @@ fn fetch_capture_settings_state(
         .ok_or_else(|| "capture settings refresh returned no selectable settings".to_owned())
 }
 
-fn build_capture_settings_cache(
+fn enable_live_view(base_url: &str, session_cookie: &str) -> Result<LiveViewEnableOutcome, String> {
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    let (status, body) = run_curl_request(
+        "POST",
+        &format!("{base_url}/ccapi/ver100/shooting/liveview"),
+        Some(session_cookie),
+        Some(&referer),
+        Some(r#"{"liveviewsize":"medium","cameradisplay":"on"}"#),
+    )?;
+    log_live_view(format!(
+        "live view enable status={status} body_prefix={}",
+        preview_text(&body)
+    ));
+
+    if matches!(status, 200 | 204) {
+        Ok(LiveViewEnableOutcome::Enabled)
+    } else if status == 503 && error_indicates_camera_busy(&body) {
+        Ok(LiveViewEnableOutcome::Busy)
+    } else {
+        Err(format!("live view enable failed with {status}: {body}"))
+    }
+}
+
+fn stop_live_view_transport(base_url: &str, session_cookie: &str) -> Result<(), String> {
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    let (status, body) = run_curl_request(
+        "DELETE",
+        &format!("{base_url}/brapi/shooting/lvscrolldetail?liveviewsize=off"),
+        Some(session_cookie),
+        Some(&referer),
+        None,
+    )?;
+    log_live_view(format!(
+        "live view transport stop status={status} body_prefix={}",
+        preview_text(&body)
+    ));
+
+    if matches!(status, 200 | 204) {
+        Ok(())
+    } else if status == 503 && body.contains("Already stopped") {
+        Ok(())
+    } else {
+        Err(format!(
+            "live view transport stop failed with {status}: {body}"
+        ))
+    }
+}
+
+fn refresh_capture_settings_state_after_change(
     camera: &ConfiguredCamera,
     session_cookie: &str,
-    initial_state: CaptureSettingsState,
-) -> Result<(CaptureSettingsCache, CaptureSettingsState), String> {
-    let mut by_mode = HashMap::new();
-    let original_mode = initial_state.mode.current.clone();
+) -> Result<CaptureSettingsState, String> {
+    const SETTLE_DELAY: Duration = Duration::from_millis(300);
 
-    if !original_mode.is_empty() {
-        by_mode.insert(original_mode.clone(), initial_state.clone());
+    thread::sleep(SETTLE_DELAY);
+    fetch_metered_capture_settings_state(camera, session_cookie)
+}
+
+fn fetch_metered_capture_settings_state(
+    camera: &ConfiguredCamera,
+    session_cookie: &str,
+) -> Result<CaptureSettingsState, String> {
+    const REFETCH_ATTEMPTS: usize = 3;
+    const REFETCH_DELAY: Duration = Duration::from_millis(300);
+
+    // User-selected values are reported by the fetch directly; the camera
+    // only publishes the estimated ones (`effective_value_tv` in P/Av/auto,
+    // `effective_value_av` in P/Tv/auto) after it recalculates the exposure,
+    // which an AF cycle reliably triggers.
+    let state = fetch_capture_settings_state(camera, session_cookie)?;
+    if state.has_complete_exposure() {
+        return Ok(state);
     }
 
-    for mode in &initial_state.mode.ability {
-        if mode == &original_mode {
-            continue;
+    if let Err(error) = trigger_focus(camera, session_cookie) {
+        log_live_view(format!("metering AF cycle failed: {error}"));
+        return Ok(state);
+    }
+
+    let mut state = state;
+    for _ in 0..REFETCH_ATTEMPTS {
+        thread::sleep(REFETCH_DELAY);
+        state = fetch_capture_settings_state(camera, session_cookie)?;
+        if state.has_complete_exposure() {
+            break;
         }
+    }
+    log_live_view(format!(
+        "metered capture settings mode={} tv={} effective_tv={} av={} effective_av={}",
+        state.mode.current,
+        state.shutter_speed.current,
+        state.effective_shutter_speed,
+        state.aperture.current,
+        state.effective_aperture
+    ));
+    Ok(state)
+}
 
-        update_selectable_camera_setting(camera, session_cookie, "shootingmode", mode)?;
-        let state = fetch_capture_settings_state(camera, session_cookie)?;
-        by_mode.insert(mode.clone(), state);
+fn build_capture_settings_cache(
+    initial_state: CaptureSettingsState,
+) -> (CaptureSettingsCache, CaptureSettingsState) {
+    let mut by_mode = HashMap::new();
+    if !initial_state.mode.current.is_empty() {
+        by_mode.insert(initial_state.mode.current.clone(), initial_state.clone());
     }
 
-    let restored_state = if original_mode.is_empty() {
-        initial_state.clone()
-    } else {
-        update_selectable_camera_setting(camera, session_cookie, "shootingmode", &original_mode)?;
-        fetch_capture_settings_state(camera, session_cookie)?
-    };
-
-    if !restored_state.mode.current.is_empty() {
-        by_mode.insert(restored_state.mode.current.clone(), restored_state.clone());
-    }
-
-    Ok((
+    (
         CaptureSettingsCache {
-            current_mode: restored_state.mode.current.clone(),
+            current_mode: initial_state.mode.current.clone(),
             by_mode,
         },
-        restored_state,
-    ))
+        initial_state,
+    )
 }
 
 fn logo_picture(bytes: &'static [u8]) -> Picture {
@@ -2169,6 +2745,7 @@ fn start_live_view_session(
         iso_dropdown,
         shutter_speed_label,
         shutter_speed_dropdown,
+        current_shutter_speed_display,
         aperture_label,
         aperture_dropdown,
         mode_dropdown_updating,
@@ -2185,6 +2762,8 @@ fn start_live_view_session(
     let child_pid_worker = child_pid.clone();
     let session_cookie = Arc::new(Mutex::new(None));
     let session_cookie_worker = session_cookie.clone();
+    let pending_added_contents = Arc::new(Mutex::new(Vec::new()));
+    let pending_added_contents_worker = pending_added_contents.clone();
     let (sender, receiver) = mpsc::channel::<LiveViewEvent>();
 
     let ui_source = glib::timeout_add_local(Duration::from_millis(33), move || {
@@ -2260,9 +2839,47 @@ fn start_live_view_session(
                         &aperture_dropdown_updating,
                         "av",
                     );
+                    update_current_shutter_speed_display(
+                        &current_shutter_speed_display,
+                        &state.display_exposure(),
+                    );
                 }
                 LiveViewEvent::CaptureSettingsCache(cache) => {
                     *capture_settings_cache.borrow_mut() = Some(cache);
+                }
+                LiveViewEvent::EffectiveExposure {
+                    shutter_speed,
+                    aperture,
+                } => {
+                    let mut cache_ref = capture_settings_cache.borrow_mut();
+                    let current_state = cache_ref.as_mut().and_then(|cache| {
+                        let current_mode = cache.current_mode.clone();
+                        cache.by_mode.get_mut(&current_mode)
+                    });
+                    if let Some(state) = current_state {
+                        // Merge into the cached state so the panel keeps the
+                        // last known value for whichever part is absent.
+                        if let Some(shutter_speed) = shutter_speed {
+                            state.effective_shutter_speed = shutter_speed;
+                        }
+                        if let Some(aperture) = aperture {
+                            state.effective_aperture = aperture;
+                        }
+                        update_current_shutter_speed_display(
+                            &current_shutter_speed_display,
+                            &state.display_exposure(),
+                        );
+                    } else {
+                        let state = CaptureSettingsState {
+                            effective_shutter_speed: shutter_speed.unwrap_or_default(),
+                            effective_aperture: aperture.unwrap_or_default(),
+                            ..CaptureSettingsState::default()
+                        };
+                        update_current_shutter_speed_display(
+                            &current_shutter_speed_display,
+                            &state.display_exposure(),
+                        );
+                    }
                 }
                 LiveViewEvent::Error(error) => {
                     if !startup_complete {
@@ -2310,6 +2927,7 @@ fn start_live_view_session(
             stop_worker.clone(),
             child_pid_worker,
             session_cookie_worker,
+            pending_added_contents_worker,
         )) && !stop_worker.load(Ordering::Relaxed)
         {
             let _ = sender.send(LiveViewEvent::Error(error));
@@ -2320,6 +2938,7 @@ fn start_live_view_session(
         stop,
         child_pid,
         session_cookie,
+        pending_added_contents,
         ui_source,
         worker,
     }
@@ -2331,15 +2950,14 @@ async fn run_live_view_session(
     stop: Arc<AtomicBool>,
     child_pid: Arc<Mutex<Option<u32>>>,
     session_cookie_slot: Arc<Mutex<Option<String>>>,
+    pending_added_contents: Arc<Mutex<Vec<String>>>,
 ) -> Result<(), String> {
     let base_url = format!(
         "http://{}:{}",
         configured_camera.host, configured_camera.port
     );
     log_live_view(format!("live-view session base URL: {base_url}"));
-    let _ = run_curl_request("GET", &format!("{base_url}/brapi/logout"), None, None, None);
-
-    let session_cookie = login_browser_remote(&base_url, &configured_camera)?;
+    let session_cookie = establish_browser_remote_session(&base_url, &configured_camera)?;
     if let Ok(mut slot) = session_cookie_slot.lock() {
         *slot = Some(session_cookie.clone());
     }
@@ -2351,24 +2969,95 @@ async fn run_live_view_session(
     let initial_capture_settings =
         prepare_browser_remote_shooting_page(&base_url, &session_cookie, &sender)?;
     if let Some(initial_capture_settings) = initial_capture_settings {
-        match build_capture_settings_cache(
-            &configured_camera,
+        let (cache, restored_state) = build_capture_settings_cache(initial_capture_settings);
+        let _ = sender.send(LiveViewEvent::CaptureSettingsCache(cache));
+        let _ = sender.send(LiveViewEvent::CaptureSettings(restored_state));
+    }
+    let polling_stop = Arc::new(AtomicBool::new(false));
+    start_event_polling(
+        base_url.clone(),
+        session_cookie.clone(),
+        sender.clone(),
+        stop.clone(),
+        polling_stop.clone(),
+        pending_added_contents,
+    );
+
+    // The Browser Remote transport starts when `/brapi/shooting/
+    // lvscrolldetail?...` is opened; resetting stale transport state before
+    // each reconnect is more reliable than proactively toggling the CCAPI
+    // live-view state here.
+    let mut consecutive_failures = 0;
+    let mut busy_retries = 0;
+    let stream_result = loop {
+        if let Err(error) = stop_live_view_transport(&base_url, &session_cookie) {
+            log_live_view(format!(
+                "live view transport stop failed before open: {error}"
+            ));
+        }
+        let result = stream_live_view(
+            &base_url,
             &session_cookie,
-            initial_capture_settings,
-        ) {
-            Ok((cache, restored_state)) => {
-                let _ = sender.send(LiveViewEvent::CaptureSettingsCache(cache));
-                let _ = sender.send(LiveViewEvent::CaptureSettings(restored_state));
+            sender.clone(),
+            stop.clone(),
+            child_pid.clone(),
+        );
+        if stop.load(Ordering::Relaxed) {
+            break result;
+        }
+        match result {
+            Ok(()) => {
+                consecutive_failures = 0;
+                busy_retries = 0;
+                log_live_view("live-view stream ended; reconnecting");
             }
             Err(error) => {
-                log_live_view(format!("capture settings cache build failed: {error}"));
+                if error_indicates_camera_busy(&error) {
+                    busy_retries += 1;
+                    if busy_retries >= 60 {
+                        break Err(error);
+                    }
+                    log_live_view(format!(
+                        "camera busy for live view (retry #{busy_retries}): {error}"
+                    ));
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+
+                if error_indicates_live_view_already_started(&error) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 6 {
+                        break Err(error);
+                    }
+                    log_live_view(format!(
+                        "live view transport already started (retry #{consecutive_failures})"
+                    ));
+                    if let Err(stop_error) = stop_live_view_transport(&base_url, &session_cookie) {
+                        log_live_view(format!(
+                            "live view transport stop after already-started failed: {stop_error}"
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+
+                consecutive_failures += 1;
+                if consecutive_failures >= 3 {
+                    break Err(error);
+                }
+                log_live_view(format!(
+                    "live-view stream error (retry #{consecutive_failures}): {error}"
+                ));
             }
         }
-    }
-    stream_live_view(&base_url, &session_cookie, sender, stop.clone(), child_pid)?;
+        thread::sleep(Duration::from_millis(500));
+    };
+    polling_stop.store(true, Ordering::Relaxed);
+    stream_result?;
 
     if !stop.load(Ordering::Relaxed) {
-        let _ = run_curl_request("GET", &format!("{base_url}/brapi/logout"), None, None, None);
+        let _ = stop_live_view_transport(&base_url, &session_cookie);
+        let _ = logout_browser_remote(&base_url, &configured_camera, Some(&session_cookie));
     }
 
     if let Ok(mut slot) = session_cookie_slot.lock() {
@@ -2378,13 +3067,95 @@ async fn run_live_view_session(
     Ok(())
 }
 
-fn login_browser_remote(
+fn establish_browser_remote_session(
     base_url: &str,
     configured_camera: &ConfiguredCamera,
 ) -> Result<String, String> {
+    const MAX_LOGIN_ATTEMPTS: usize = 3;
+    const LOGIN_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+    match login_browser_remote(base_url, configured_camera) {
+        Ok(session_cookie) => return Ok(session_cookie),
+        Err(BrowserRemoteLoginError::AlreadyInUse) => {
+            log_live_view("browser remote already in use; forcing session reset");
+        }
+        Err(error) => return Err(error.into_message()),
+    }
+
+    for attempt in 1..=MAX_LOGIN_ATTEMPTS {
+        if let Err(error) = logout_browser_remote(base_url, configured_camera, None) {
+            log_live_view(format!(
+                "browser remote logout reset attempt #{attempt} failed: {error}"
+            ));
+        }
+
+        match login_browser_remote(base_url, configured_camera) {
+            Ok(session_cookie) => return Ok(session_cookie),
+            Err(BrowserRemoteLoginError::AlreadyInUse) if attempt < MAX_LOGIN_ATTEMPTS => {
+                log_live_view(format!(
+                    "browser remote still in use after reset; retrying (attempt #{attempt})"
+                ));
+                thread::sleep(LOGIN_RETRY_DELAY);
+            }
+            Err(error) => return Err(error.into_message()),
+        }
+    }
+
+    Err("Browser Remote is already in use".to_owned())
+}
+
+fn logout_browser_remote(
+    base_url: &str,
+    configured_camera: &ConfiguredCamera,
+    session_cookie: Option<&str>,
+) -> Result<(), String> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-L",
+        "-b",
+        "",
+        "-c",
+        "/dev/null",
+        "-D",
+        "-",
+        "-o",
+        "/dev/null",
+    ]);
+
+    if let Some((username, password)) = configured_camera.credentials() {
+        command.args(["--digest", "-u", &format!("{username}:{password}")]);
+    }
+
+    if let Some(cookie) = session_cookie {
+        command.args(["-H", &format!("Cookie: {cookie}")]);
+    }
+
+    command.arg(format!("{base_url}/brapi/logout"));
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to run curl for Browser Remote logout: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("curl Browser Remote logout failed: {stderr}"));
+    }
+
+    let headers = String::from_utf8_lossy(&output.stdout);
+    log_live_view(format!(
+        "browser remote logout headers:\n{}",
+        headers.trim_end()
+    ));
+    Ok(())
+}
+
+fn login_browser_remote(
+    base_url: &str,
+    configured_camera: &ConfiguredCamera,
+) -> Result<String, BrowserRemoteLoginError> {
     let (username, password) = configured_camera
         .credentials()
-        .ok_or_else(|| "Browser Remote requires username and password".to_owned())?;
+        .ok_or(BrowserRemoteLoginError::MissingCredentials)?;
     let output = Command::new("curl")
         .args([
             "-sS",
@@ -2398,11 +3169,17 @@ fn login_browser_remote(
             &format!("{base_url}/brapi/login"),
         ])
         .output()
-        .map_err(|error| format!("failed to run curl for Browser Remote login: {error}"))?;
+        .map_err(|error| {
+            BrowserRemoteLoginError::Curl(format!(
+                "failed to run curl for Browser Remote login: {error}"
+            ))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("curl Browser Remote login failed: {stderr}"));
+        return Err(BrowserRemoteLoginError::Curl(format!(
+            "curl Browser Remote login failed: {stderr}"
+        )));
     }
 
     let headers = String::from_utf8_lossy(&output.stdout);
@@ -2410,6 +3187,10 @@ fn login_browser_remote(
         "browser remote login headers:\n{}",
         headers.trim_end()
     ));
+    parse_browser_remote_login_headers(&headers)
+}
+
+fn parse_browser_remote_login_headers(headers: &str) -> Result<String, BrowserRemoteLoginError> {
     let location = headers
         .lines()
         .filter_map(|line| line.strip_prefix("Location:"))
@@ -2418,12 +3199,12 @@ fn login_browser_remote(
         .unwrap_or_default();
 
     if location == "/wpd/already_login.shtml" {
-        return Err("Browser Remote is already in use".to_owned());
+        return Err(BrowserRemoteLoginError::AlreadyInUse);
     }
 
     if location != "/wpd/topmenu.shtml" {
-        return Err(format!(
-            "unexpected Browser Remote landing page `{location}`"
+        return Err(BrowserRemoteLoginError::UnexpectedLandingPage(
+            location.to_owned(),
         ));
     }
 
@@ -2434,7 +3215,7 @@ fn login_browser_remote(
         .filter_map(|line| line.split(';').next())
         .find(|cookie| cookie.starts_with("brsessionid="))
         .map(str::to_owned)
-        .ok_or_else(|| "missing Browser Remote session cookie".to_owned())
+        .ok_or(BrowserRemoteLoginError::MissingSessionCookie)
 }
 
 fn prepare_browser_remote_shooting_page(
@@ -2471,6 +3252,7 @@ fn prepare_browser_remote_shooting_page(
     ));
 
     if status == 200 {
+        log_live_view_state_summary("currentproperty", &body);
         let capture_settings = parse_capture_settings_state(&body);
         if let Some(state) = parse_focus_mode_state(&body) {
             let _ = sender.send(LiveViewEvent::FocusMode(state));
@@ -2504,6 +3286,107 @@ fn parse_focus_mode_state(body: &str) -> Option<FocusModeState> {
     })
 }
 
+fn summarize_live_view_state(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let mut parts = Vec::new();
+
+    if let Some(message) = value.get("message").and_then(Value::as_str) {
+        parts.push(format!("message={message}"));
+    }
+
+    if let Some(liveview) = value.get("liveview") {
+        let liveviewsize = liveview
+            .get("liveviewsize")
+            .and_then(Value::as_str)
+            .unwrap_or("-");
+        let cameradisplay = liveview
+            .get("cameradisplay")
+            .and_then(Value::as_str)
+            .unwrap_or("-");
+        parts.push(format!(
+            "liveviewsize={liveviewsize} cameradisplay={cameradisplay}"
+        ));
+    }
+
+    if let Some(imagereview) = value
+        .get("imagereview")
+        .and_then(|node| node.get("value"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("imagereview={imagereview}"));
+    }
+
+    if let Some(mode) = value
+        .get("shootingmode")
+        .and_then(|node| node.get("value"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("shootingmode={mode}"));
+    }
+
+    if let Some(moviemode) = value
+        .get("moviemode")
+        .and_then(|node| node.get("status"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("moviemode={moviemode}"));
+    }
+
+    if let Some(recbutton) = value
+        .get("recbutton")
+        .and_then(|node| node.get("status"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("recbutton={recbutton}"));
+    }
+
+    if let Some(recordableshots) = value
+        .get("recordable")
+        .and_then(|node| node.get("recordableshots"))
+        .and_then(Value::as_i64)
+    {
+        parts.push(format!("recordableshots={recordableshots}"));
+    }
+
+    if let Some(remainingtime) = value
+        .get("recordable")
+        .and_then(|node| node.get("remainingtime"))
+    {
+        let remainingtime = match remainingtime {
+            Value::Null => "null".to_owned(),
+            Value::String(value) => value.clone(),
+            other => other.to_string(),
+        };
+        parts.push(format!("remainingtime={remainingtime}"));
+    }
+
+    if let Some(tv) = value
+        .get("effective_value_tv")
+        .and_then(|node| node.get("value"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("effective_tv={tv}"));
+    }
+
+    if let Some(av) = value
+        .get("effective_value_av")
+        .and_then(|node| node.get("value"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("effective_av={av}"));
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn log_live_view_state_summary(label: &str, body: &str) {
+    if let Some(summary) = summarize_live_view_state(body) {
+        log_live_view(format!("{label} state: {summary}"));
+    }
+}
+
 fn parse_capture_settings_state(body: &str) -> Option<CaptureSettingsState> {
     let value: Value = serde_json::from_str(body).ok()?;
     let state = CaptureSettingsState {
@@ -2511,6 +3394,8 @@ fn parse_capture_settings_state(body: &str) -> Option<CaptureSettingsState> {
         iso: parse_selectable_setting_state(&value, "iso"),
         shutter_speed: parse_selectable_setting_state(&value, "tv"),
         aperture: parse_selectable_setting_state(&value, "av"),
+        effective_shutter_speed: parse_setting_value(&value, "effective_value_tv"),
+        effective_aperture: parse_setting_value(&value, "effective_value_av"),
     };
 
     (state.mode.is_available()
@@ -2518,6 +3403,15 @@ fn parse_capture_settings_state(body: &str) -> Option<CaptureSettingsState> {
         || state.shutter_speed.is_available()
         || state.aperture.is_available())
     .then_some(state)
+}
+
+fn parse_setting_value(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|node| node.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn parse_selectable_setting_state(value: &Value, key: &str) -> SelectableSettingState {
@@ -2586,6 +3480,8 @@ fn stream_live_view(
         .args([
             "-sS",
             "--no-buffer",
+            "--dump-header",
+            "/dev/stderr",
             "-H",
             &format!("Cookie: {session_cookie}"),
             "-e",
@@ -2610,6 +3506,13 @@ fn stream_live_view(
     let mut chunk = [0_u8; 8192];
     let mut parsed_frames = 0_u64;
     let mut inspected_start = false;
+    // The camera sometimes stops rendering live view (e.g. after a shooting
+    // mode change) while keeping the stream open and delivering tiny blank
+    // frames; watch for that and re-enable rendering.
+    const BLANK_STREAK_THRESHOLD: u64 = 30;
+    const REENABLE_RETRY_FRAMES: u64 = 90;
+    let mut blank_frame_streak = 0_u64;
+    let mut next_reenable_at = BLANK_STREAK_THRESHOLD;
 
     while !stop.load(Ordering::Relaxed) {
         let read = stdout.read(&mut chunk).map_err(|error| error.to_string())?;
@@ -2628,6 +3531,22 @@ fn stream_live_view(
                 ));
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(stderr) = stderr.as_mut() {
+                    let mut err = String::new();
+                    let _ = stderr.read_to_string(&mut err);
+                    if !err.trim().is_empty() {
+                        log_live_view(format!(
+                            "live-view stream transport stderr_prefix={}",
+                            preview_text(&err)
+                        ));
+                    }
+                }
+                log_live_view_state_summary("live-view stream JSON response", &body);
+                log_live_view_currentproperty_debug_snapshot(
+                    base_url,
+                    session_cookie,
+                    "stream-json-response",
+                );
                 if let Ok(mut pid_slot) = child_pid.lock() {
                     *pid_slot = None;
                 }
@@ -2641,7 +3560,25 @@ fn stream_live_view(
                     .collect::<String>()
             ));
         }
-        drain_live_view_frames(&mut buffer, &sender, &mut parsed_frames);
+        drain_live_view_frames(
+            &mut buffer,
+            &sender,
+            &mut parsed_frames,
+            &mut blank_frame_streak,
+        );
+
+        if blank_frame_streak == 0 {
+            next_reenable_at = BLANK_STREAK_THRESHOLD;
+        } else if blank_frame_streak >= next_reenable_at {
+            log_live_view(format!(
+                "re-enabling live view after {blank_frame_streak} blank frames"
+            ));
+            match enable_live_view(base_url, session_cookie) {
+                Ok(LiveViewEnableOutcome::Enabled | LiveViewEnableOutcome::Busy) => {}
+                Err(error) => log_live_view(format!("live view enable failed: {error}")),
+            }
+            next_reenable_at = blank_frame_streak + REENABLE_RETRY_FRAMES;
+        }
     }
 
     let _ = child.kill();
@@ -2662,6 +3599,166 @@ fn stream_live_view(
         return Err("live view stream ended without decoded frames".to_owned());
     }
     Ok(())
+}
+
+fn start_event_polling(
+    base_url: String,
+    session_cookie: String,
+    sender: mpsc::Sender<LiveViewEvent>,
+    stop: Arc<AtomicBool>,
+    polling_stop: Arc<AtomicBool>,
+    pending_added_contents: Arc<Mutex<Vec<String>>>,
+) {
+    // Browser Remote's shoot page keeps a `/ccapi/ver100/event/polling` loop
+    // running next to the live-view stream; it is the channel that delivers
+    // ongoing value changes such as the metered shutter speed in P/Av modes.
+    thread::spawn(move || {
+        const POLL_PAUSE: Duration = Duration::from_millis(500);
+
+        let referer = format!("{base_url}/wpd/shoot.shtml");
+        let mut polls = 0_u64;
+        log_live_view("event polling started");
+        while !stop.load(Ordering::Relaxed) && !polling_stop.load(Ordering::Relaxed) {
+            match run_event_polling_request(&base_url, &session_cookie, &referer) {
+                Ok((200, body)) => {
+                    polls += 1;
+                    let added_contents = parse_added_contents(&body);
+                    if !added_contents.is_empty() {
+                        log_live_view(format!(
+                            "event poll #{polls} added contents: {}",
+                            added_contents.join(", ")
+                        ));
+                        if let Ok(mut pending) = pending_added_contents.lock() {
+                            pending.extend(added_contents);
+                        }
+                    }
+                    if polls <= 5 {
+                        log_live_view(format!(
+                            "event poll #{polls} body_prefix={}",
+                            preview_text(&body)
+                        ));
+                        log_live_view_state_summary(&format!("event poll #{polls}"), &body);
+                    }
+                    // The camera reports its own live-view rendering state
+                    // here; log it to trace live view going blank.
+                    if let Ok(value) = serde_json::from_str::<Value>(&body)
+                        && let Some(liveview) = value.get("liveview")
+                    {
+                        log_live_view(format!("event poll #{polls} liveview state={liveview}"));
+                    }
+                    let (shutter_speed, aperture) = parse_event_effective_exposure(&body);
+                    if shutter_speed.is_some() || aperture.is_some() {
+                        log_live_view(format!(
+                            "event poll #{polls} effective exposure tv={} av={}",
+                            shutter_speed.as_deref().unwrap_or("-"),
+                            aperture.as_deref().unwrap_or("-")
+                        ));
+                        let _ = sender.send(LiveViewEvent::EffectiveExposure {
+                            shutter_speed,
+                            aperture,
+                        });
+                    }
+                }
+                Ok((status, body)) => {
+                    log_live_view(format!(
+                        "event polling stopped after status={status} body_prefix={}",
+                        preview_text(&body)
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    // The long poll timing out without events is the idle case.
+                }
+            }
+            thread::sleep(POLL_PAUSE);
+        }
+        log_live_view("event polling stopped");
+    });
+}
+
+fn run_event_polling_request(
+    base_url: &str,
+    session_cookie: &str,
+    referer: &str,
+) -> Result<(u16, String), String> {
+    // Bounded so the polling thread can notice the stop flags even when the
+    // camera holds the long poll open.
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "5",
+            "-H",
+            &format!("Cookie: {session_cookie}"),
+            "-e",
+            referer,
+            "-w",
+            "\n__STATUS__:%{http_code}",
+            &format!("{base_url}/ccapi/ver100/event/polling?continue=on"),
+        ])
+        .output()
+        .map_err(|error| format!("failed to run curl for event polling: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("event polling request failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (body, status) = stdout
+        .rsplit_once("\n__STATUS__:")
+        .ok_or_else(|| "event polling response missing status marker".to_owned())?;
+    let status = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|error| format!("invalid event polling status: {error}"))?;
+    Ok((status, body.to_owned()))
+}
+
+fn parse_event_effective_exposure(body: &str) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (None, None);
+    };
+    // The `effective_value_*` keys carry the metered values in modes where
+    // the camera estimates them; `tv`/`av` carry user-selected ones.
+    let extract = |keys: [&str; 2]| {
+        keys.iter().find_map(|key| {
+            let setting_value = value.get(key)?.get("value")?.as_str()?.trim();
+            (!setting_value.is_empty()).then(|| setting_value.to_owned())
+        })
+    };
+    (
+        extract(["effective_value_tv", "tv"]),
+        extract(["effective_value_av", "av"]),
+    )
+}
+
+fn log_live_view_currentproperty_debug_snapshot(
+    base_url: &str,
+    session_cookie: &str,
+    context: &str,
+) {
+    let referer = format!("{base_url}/wpd/shoot.shtml");
+    match run_curl_request(
+        "GET",
+        &format!("{base_url}/brapi/currentproperty"),
+        Some(session_cookie),
+        Some(&referer),
+        None,
+    ) {
+        Ok((status, body)) => {
+            log_live_view(format!(
+                "{context} currentproperty status={status} body_prefix={}",
+                preview_text(&body)
+            ));
+            log_live_view_state_summary(&format!("{context} currentproperty"), &body);
+        }
+        Err(error) => {
+            log_live_view(format!(
+                "{context} currentproperty debug snapshot failed: {error}"
+            ));
+        }
+    }
 }
 
 fn run_curl_request(
@@ -2858,15 +3955,20 @@ fn apply_storage_policy_to_capture(
     workspace: &Path,
     storage: StorageMode,
     media_kind: CapturedMediaKind,
-) -> Result<String, String> {
+    pending_added_contents: &Arc<Mutex<Vec<String>>>,
+) -> Result<CaptureOutcome, String> {
+    let contents = wait_for_added_contents(pending_added_contents, media_kind)?;
+
     if storage == StorageMode::CameraOnly {
-        return Ok(match media_kind {
-            CapturedMediaKind::Picture => "Picture captured on camera.".to_owned(),
-            CapturedMediaKind::Video => "Video captured on camera.".to_owned(),
+        return Ok(CaptureOutcome {
+            status_message: match media_kind {
+                CapturedMediaKind::Picture => "Picture captured on camera.".to_owned(),
+                CapturedMediaKind::Video => "Video captured on camera.".to_owned(),
+            },
+            path_labels: contents,
         });
     }
 
-    let contents = wait_for_added_contents(camera, session_cookie, media_kind)?;
     let downloaded_paths =
         download_contents_to_workspace(camera, session_cookie, workspace, &contents)?;
 
@@ -2895,26 +3997,32 @@ fn apply_storage_policy_to_capture(
     };
     let destination = workspace.display();
 
-    Ok(match storage {
-        StorageMode::CameraOnly => unreachable!("camera only is returned early"),
-        StorageMode::WorkspaceOnly => {
-            format!("{noun} downloaded to {destination} and removed from camera.")
-        }
-        StorageMode::Both => format!("{noun} captured on camera and downloaded to {destination}."),
+    Ok(CaptureOutcome {
+        status_message: match storage {
+            StorageMode::CameraOnly => unreachable!("camera only is returned early"),
+            StorageMode::WorkspaceOnly => {
+                format!("{noun} downloaded to {destination} and removed from camera.")
+            }
+            StorageMode::Both => {
+                format!("{noun} captured on camera and downloaded to {destination}.")
+            }
+        },
+        path_labels: downloaded_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
     })
 }
 
 fn wait_for_added_contents(
-    camera: &ConfiguredCamera,
-    session_cookie: &str,
+    pending_added_contents: &Arc<Mutex<Vec<String>>>,
     media_kind: CapturedMediaKind,
 ) -> Result<Vec<String>, String> {
     const MAX_ATTEMPTS: usize = 20;
     const POLL_DELAY: Duration = Duration::from_millis(500);
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let contents = poll_added_contents(camera, session_cookie)?;
-        let matching_contents = filter_added_contents_by_media_kind(contents, media_kind);
+        let matching_contents = take_matching_added_contents(pending_added_contents, media_kind);
         if !matching_contents.is_empty() {
             log_live_view(format!(
                 "capture contents detected after poll #{attempt}: {}",
@@ -2928,39 +4036,42 @@ fn wait_for_added_contents(
     Err("timed out waiting for captured content to appear on the camera".to_owned())
 }
 
-fn poll_added_contents(
-    camera: &ConfiguredCamera,
-    session_cookie: &str,
-) -> Result<Vec<String>, String> {
-    let base_url = format!("http://{}:{}", camera.host, camera.port);
-    let referer = format!("{base_url}/wpd/shoot.shtml");
-    let (status, body) = run_curl_request(
-        "GET",
-        &format!("{base_url}/ccapi/ver100/event/polling?continue=on"),
-        Some(session_cookie),
-        Some(&referer),
-        None,
-    )?;
-    log_live_view(format!(
-        "event polling status={status} body_prefix={}",
-        preview_text(&body)
-    ));
-
-    if status != 200 {
-        return Err(format!("event polling failed with {status}: {body}"));
+fn clear_pending_added_contents(pending_added_contents: &Arc<Mutex<Vec<String>>>) {
+    if let Ok(mut pending) = pending_added_contents.lock() {
+        pending.clear();
     }
+}
 
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|error| format!("failed to parse event polling response: {error}"))?;
+fn take_matching_added_contents(
+    pending_added_contents: &Arc<Mutex<Vec<String>>>,
+    media_kind: CapturedMediaKind,
+) -> Vec<String> {
+    let Ok(mut pending) = pending_added_contents.lock() else {
+        return Vec::new();
+    };
 
-    Ok(value
-        .get("addedcontents")
-        .and_then(Value::as_array)
+    let mut matching = Vec::new();
+    let mut remaining = Vec::new();
+    for content in pending.drain(..) {
+        if filter_added_contents_by_media_kind(vec![content.clone()], media_kind).is_empty() {
+            remaining.push(content);
+        } else {
+            matching.push(content);
+        }
+    }
+    *pending = remaining;
+    matching
+}
+
+fn parse_added_contents(body: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("addedcontents").cloned())
+        .and_then(|value| value.as_array().cloned())
         .into_iter()
         .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect())
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
 }
 
 fn filter_added_contents_by_media_kind(
@@ -3171,7 +4282,11 @@ fn drain_live_view_frames(
     buffer: &mut Vec<u8>,
     sender: &mpsc::Sender<LiveViewEvent>,
     parsed_frames: &mut u64,
+    blank_frame_streak: &mut u64,
 ) {
+    // The camera renders "no live view" as a tiny (<1 KiB) black JPEG; real
+    // frames are two orders of magnitude larger.
+    const BLANK_FRAME_MAX_BYTES: usize = 10_240;
     let mut cursor = 0usize;
 
     while cursor + 9 <= buffer.len() {
@@ -3217,6 +4332,24 @@ fn drain_live_view_frames(
             let _ = sender.send(LiveViewEvent::FocusOverlay(overlay_state));
         }
         if payload.starts_with(&[0xFF, 0xD8]) {
+            if payload.len() < BLANK_FRAME_MAX_BYTES {
+                *blank_frame_streak += 1;
+                if *blank_frame_streak == 1 {
+                    log_live_view(format!(
+                        "live view went blank (frame #{} {} bytes)",
+                        *parsed_frames,
+                        payload.len()
+                    ));
+                }
+            } else {
+                if *blank_frame_streak > 0 {
+                    log_live_view(format!(
+                        "live view recovered after {} blank frames",
+                        *blank_frame_streak
+                    ));
+                }
+                *blank_frame_streak = 0;
+            }
             let _ = sender.send(LiveViewEvent::Frame(payload.to_vec()));
         }
         cursor = frame_end;
@@ -3331,10 +4464,6 @@ fn shifted_focus_overlay_state(
     state: &FocusOverlayState,
     direction: FocusDirection,
 ) -> Option<FocusOverlayState> {
-    if !state.active || state.image_width <= 0.0 || state.image_height <= 0.0 {
-        return None;
-    }
-
     let step_x = state.frame_width.max(64.0);
     let step_y = state.frame_height.max(64.0);
     let mut next = state.clone();
@@ -3362,14 +4491,7 @@ fn shifted_focus_overlay_state(
         FocusDirection::Right => next.frame_x += step_x,
     }
 
-    next.frame_x = next.frame_x.clamp(
-        next.image_x,
-        next.image_x + next.image_width - next.frame_width,
-    );
-    next.frame_y = next.frame_y.clamp(
-        next.image_y,
-        next.image_y + next.image_height - next.frame_height,
-    );
+    clamp_focus_overlay_frame(&mut next)?;
     Some(next)
 }
 
@@ -3379,6 +4501,71 @@ fn focus_target_x(state: &FocusOverlayState) -> i32 {
 
 fn focus_target_y(state: &FocusOverlayState) -> i32 {
     (state.frame_y + state.frame_height / 2.0).round() as i32
+}
+
+fn focus_overlay_state_from_click(
+    state: &FocusOverlayState,
+    available_width: f64,
+    available_height: f64,
+    click_x: f64,
+    click_y: f64,
+) -> Result<FocusOverlayState, &'static str> {
+    if !focus_overlay_is_selectable(state, available_width, available_height) {
+        return Err("Focus point unavailable.");
+    }
+
+    let (offset_x, offset_y, scaled_width, scaled_height) = contained_image_rect(
+        available_width,
+        available_height,
+        state.image_width,
+        state.image_height,
+    );
+    let image_right = offset_x + scaled_width;
+    let image_bottom = offset_y + scaled_height;
+    if click_x < offset_x || click_x > image_right || click_y < offset_y || click_y > image_bottom {
+        return Err("Click inside the live view image to focus.");
+    }
+
+    let scale_x = scaled_width / state.image_width;
+    let scale_y = scaled_height / state.image_height;
+    let target_x = state.image_x + (click_x - offset_x) / scale_x;
+    let target_y = state.image_y + (click_y - offset_y) / scale_y;
+
+    let mut next = state.clone();
+    next.frame_x = target_x - next.frame_width / 2.0;
+    next.frame_y = target_y - next.frame_height / 2.0;
+    clamp_focus_overlay_frame(&mut next).ok_or("Focus point unavailable.")?;
+    Ok(next)
+}
+
+fn focus_overlay_is_selectable(
+    state: &FocusOverlayState,
+    available_width: f64,
+    available_height: f64,
+) -> bool {
+    state.active
+        && state.image_width > 0.0
+        && state.image_height > 0.0
+        && state.frame_width > 0.0
+        && state.frame_height > 0.0
+        && state.frame_width <= state.image_width
+        && state.frame_height <= state.image_height
+        && available_width > 0.0
+        && available_height > 0.0
+}
+
+fn clamp_focus_overlay_frame(state: &mut FocusOverlayState) -> Option<()> {
+    focus_overlay_is_selectable(state, 1.0, 1.0).then_some(())?;
+
+    state.frame_x = state.frame_x.clamp(
+        state.image_x,
+        state.image_x + state.image_width - state.frame_width,
+    );
+    state.frame_y = state.frame_y.clamp(
+        state.image_y,
+        state.image_y + state.image_height - state.frame_height,
+    );
+    Some(())
 }
 
 fn move_focus_point(
@@ -3417,6 +4604,14 @@ fn move_focus_point(
 
 fn log_live_view(message: impl AsRef<str>) {
     eprintln!("[argus-capture liveview] {}", message.as_ref());
+}
+
+fn error_indicates_camera_busy(error: &str) -> bool {
+    error.contains("During shooting or recording")
+}
+
+fn error_indicates_live_view_already_started(error: &str) -> bool {
+    error.contains("Already started")
 }
 
 fn preview_text(text: &str) -> String {
@@ -3489,5 +4684,151 @@ mod tests {
             ),
             "http://camera.local:8080/ccapi/ver130/contents/card1/DCIM/100CANON/IMG_0001.JPG?kind=main"
         );
+    }
+
+    #[test]
+    fn derives_camera_scan_mask_from_ipv4_host() {
+        assert_eq!(
+            default_camera_scan_mask("192.168.1.23"),
+            "192.168.1.xxx".to_owned()
+        );
+    }
+
+    #[test]
+    fn leaves_camera_scan_mask_empty_for_non_ipv4_hosts() {
+        assert!(default_camera_scan_mask("camera.local").is_empty());
+    }
+
+    #[test]
+    fn maps_live_view_click_to_focus_target() {
+        let state = FocusOverlayState {
+            image_x: 0.0,
+            image_y: 0.0,
+            image_width: 200.0,
+            image_height: 100.0,
+            frame_x: 40.0,
+            frame_y: 30.0,
+            frame_width: 20.0,
+            frame_height: 10.0,
+            active: true,
+        };
+
+        let next = focus_overlay_state_from_click(&state, 400.0, 200.0, 300.0, 100.0).unwrap();
+
+        assert_eq!(focus_target_x(&next), 150);
+        assert_eq!(focus_target_y(&next), 50);
+    }
+
+    #[test]
+    fn rejects_live_view_clicks_outside_the_image() {
+        let state = FocusOverlayState {
+            image_x: 0.0,
+            image_y: 0.0,
+            image_width: 200.0,
+            image_height: 100.0,
+            frame_x: 40.0,
+            frame_y: 30.0,
+            frame_width: 20.0,
+            frame_height: 10.0,
+            active: true,
+        };
+
+        let error = focus_overlay_state_from_click(&state, 400.0, 300.0, 10.0, 10.0).unwrap_err();
+
+        assert_eq!(error, "Click inside the live view image to focus.");
+    }
+
+    #[test]
+    fn parses_browser_remote_login_cookie_from_headers() {
+        let cookie = parse_browser_remote_login_headers(
+            "HTTP/1.1 401 Unauthorized\n\
+             WWW-Authenticate: Digest realm=\"BrowserRemote\"\n\
+             \n\
+             HTTP/1.1 303 See Other\n\
+             Location:/wpd/topmenu.shtml\n\
+             Set-Cookie: brsessionid=abc123; Path=/; HttpOnly\n",
+        )
+        .unwrap();
+
+        assert_eq!(cookie, "brsessionid=abc123");
+    }
+
+    #[test]
+    fn reports_browser_remote_login_collision() {
+        let error = parse_browser_remote_login_headers(
+            "HTTP/1.1 401 Unauthorized\n\
+             WWW-Authenticate: Digest realm=\"BrowserRemote\"\n\
+             \n\
+             HTTP/1.1 303 See Other\n\
+             Location:/wpd/already_login.shtml\n",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, BrowserRemoteLoginError::AlreadyInUse);
+    }
+
+    #[test]
+    fn detects_camera_busy_errors() {
+        assert!(error_indicates_camera_busy(
+            "live view stream returned body: {\"message\":\"During shooting or recording\"}"
+        ));
+        assert!(!error_indicates_camera_busy(
+            "unexpected Browser Remote landing page"
+        ));
+    }
+
+    #[test]
+    fn detects_live_view_already_started_errors() {
+        assert!(error_indicates_live_view_already_started(
+            "live view stream returned body: {\"message\":\"Already started\"}"
+        ));
+        assert!(!error_indicates_live_view_already_started(
+            "live view stream ended without decoded frames"
+        ));
+    }
+
+    #[test]
+    fn seeds_capture_settings_cache_with_current_mode_only() {
+        let state = CaptureSettingsState {
+            mode: SelectableSettingState {
+                current: "av".to_owned(),
+                ability: vec!["fv".to_owned(), "av".to_owned(), "m".to_owned()],
+            },
+            iso: SelectableSettingState {
+                current: "800".to_owned(),
+                ability: vec!["auto".to_owned(), "800".to_owned()],
+            },
+            ..CaptureSettingsState::default()
+        };
+
+        let (cache, restored_state) = build_capture_settings_cache(state.clone());
+
+        assert_eq!(restored_state.mode.current, "av");
+        assert_eq!(cache.current_mode, "av");
+        assert_eq!(cache.by_mode.len(), 1);
+        assert!(cache.by_mode.contains_key("av"));
+    }
+
+    #[test]
+    fn summarizes_live_view_state_fields() {
+        let summary = summarize_live_view_state(
+            r#"{
+                "message":"Already started",
+                "liveview":{"liveviewsize":"medium","cameradisplay":"on"},
+                "imagereview":{"value":"2"},
+                "shootingmode":{"value":"av"},
+                "moviemode":{"status":"off"},
+                "recbutton":{"status":"stop"},
+                "recordable":{"recordableshots":5834,"remainingtime":null},
+                "effective_value_av":{"value":"f4.5"}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(summary.contains("message=Already started"));
+        assert!(summary.contains("liveviewsize=medium cameradisplay=on"));
+        assert!(summary.contains("imagereview=2"));
+        assert!(summary.contains("recordableshots=5834"));
+        assert!(summary.contains("remainingtime=null"));
     }
 }

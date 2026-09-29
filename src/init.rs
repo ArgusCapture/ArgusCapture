@@ -24,8 +24,6 @@ use crate::network::{self, NetworkCamera};
 
 type InitResult<T> = Result<T, Box<dyn Error>>;
 
-const DEFAULT_CAMERA_NAME: &str = "Camera1";
-
 pub(crate) async fn initialize_user_config() -> InitResult<()> {
     let config_path = config::user_config_path()?;
 
@@ -48,7 +46,7 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
     let storage = config::default_storage();
 
     let mut configured_camera = ConfiguredCamera {
-        name: suggest_camera_name(selected_camera.as_ref()),
+        name: network::suggest_camera_name(selected_camera.as_ref()),
         host: selected_camera
             .as_ref()
             .map(|camera| camera.address.clone())
@@ -73,7 +71,7 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
     };
 
     if let Some(camera) = network::inspect_configured_camera(&configured_camera).await {
-        configured_camera.name = suggest_camera_name(Some(&camera));
+        configured_camera.name = network::suggest_camera_name(Some(&camera));
     }
 
     configured_camera.name = prompt_with_default("Camera name", &configured_camera.name)?;
@@ -179,35 +177,6 @@ fn prompt_line(label: &str) -> io::Result<String> {
     Ok(input)
 }
 
-fn suggest_camera_name(camera: Option<&NetworkCamera>) -> String {
-    let source = camera
-        .map(NetworkCamera::display_name)
-        .unwrap_or_else(|| DEFAULT_CAMERA_NAME.to_owned());
-
-    let sanitized: String = source
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|segment| !segment.is_empty())
-        .map(title_case_segment)
-        .collect();
-    if sanitized.is_empty() {
-        DEFAULT_CAMERA_NAME.to_owned()
-    } else {
-        sanitized
-    }
-}
-
-fn title_case_segment(segment: &str) -> String {
-    let mut characters = segment.chars();
-    let Some(first) = characters.next() else {
-        return String::new();
-    };
-
-    let mut value = String::new();
-    value.push(first.to_ascii_uppercase());
-    value.extend(characters);
-    value
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,12 +190,12 @@ mod tests {
             model: "EOS R3".to_owned(),
         };
 
-        assert_eq!(suggest_camera_name(Some(&camera)), "CanonEOSR3");
+        assert_eq!(network::suggest_camera_name(Some(&camera)), "CanonEOSR3");
     }
 
     #[test]
     fn falls_back_to_default_camera_name() {
-        assert_eq!(suggest_camera_name(None), "Camera1");
+        assert_eq!(network::suggest_camera_name(None), "Camera1");
     }
 
     #[test]
@@ -238,7 +207,7 @@ mod tests {
             model: "RLC 811A".to_owned(),
         };
 
-        assert_eq!(suggest_camera_name(Some(&camera)), "RLC811A");
+        assert_eq!(network::suggest_camera_name(Some(&camera)), "RLC811A");
     }
 
     #[test]
@@ -250,12 +219,9 @@ mod tests {
             model: "CCAPI camera".to_owned(),
         };
 
-        assert_eq!(suggest_camera_name(Some(&camera)), "CanonCCAPICamera");
-    }
-
-    #[test]
-    fn title_cases_individual_segments() {
-        assert_eq!(title_case_segment("camera"), "Camera");
-        assert_eq!(title_case_segment("CCAPI"), "CCAPI");
+        assert_eq!(
+            network::suggest_camera_name(Some(&camera)),
+            "CanonCCAPICamera"
+        );
     }
 }

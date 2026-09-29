@@ -28,14 +28,15 @@ Argus Capture is named after [Argus](https://en.wikipedia.org/wiki/Argus_Panopte
 ## Features
 
 - Native GTK4 desktop UI
-- Camera configuration editor with General and Camera tabs
+- Camera configuration editor with General and Camera tabs, including Canon network-mask scanning
 - Configurable workspace directory for downloaded captures
 - Configurable storage policies: camera only, workspace only, or both
 - Browser Remote / CCAPI-based network camera control
 - Live view preview in the main window
-- Focus controls, including AF trigger and focus-point movement
+- Focus controls, including AF trigger, focus-point movement, and click-to-focus in live view
 - Still photo capture
 - Video recording start/stop from the same capture control
+- Capture result pop-up showing the saved picture/video path
 - Automatic download and optional camera-side deletion based on storage policy
 - Embedded application logo used inside the binary
 - GNOME/Wayland desktop integration files under `contrib/wayland`
@@ -74,6 +75,17 @@ git clone https://github.com/ArgusCapture/ArgusCapture.git
 cd ArgusCapture
 cargo build
 cd target/debug
+```
+
+### Release build with debug symbols
+
+The following commands will create an optimized build that still includes debug symbols for profiling or backtraces.
+
+```sh
+git clone https://github.com/ArgusCapture/ArgusCapture.git
+cd ArgusCapture
+cargo build --profile release-with-debug
+cd target/release-with-debug
 ```
 
 Running `./argus-capture` without options launches the native GTK4 UI.

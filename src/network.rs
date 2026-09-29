@@ -39,6 +39,7 @@ const MAX_SCAN_PREFIX: u8 = 24;
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const UNKNOWN_CAMERA: &str = "Unknown ONVIF camera";
 const CANON_CCAPI_CAMERA: &str = "CCAPI camera";
+const DEFAULT_CAMERA_NAME: &str = "Camera1";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct NetworkCamera {
@@ -59,6 +60,24 @@ impl NetworkCamera {
             }
             _ => self.model.clone(),
         }
+    }
+}
+
+pub(crate) fn suggest_camera_name(camera: Option<&NetworkCamera>) -> String {
+    let source = camera
+        .map(NetworkCamera::display_name)
+        .unwrap_or_else(|| DEFAULT_CAMERA_NAME.to_owned());
+
+    let sanitized: String = source
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .map(title_case_segment)
+        .collect();
+
+    if sanitized.is_empty() {
+        DEFAULT_CAMERA_NAME.to_owned()
+    } else {
+        sanitized
     }
 }
 
@@ -83,14 +102,17 @@ pub(crate) async fn discover_network_cameras(
     }
 
     let mut cameras = cameras.into_values().collect::<Vec<_>>();
-    cameras.sort_by(|left, right| {
-        left.address
-            .cmp(&right.address)
-            .then_with(|| left.model.cmp(&right.model))
-            .then_with(|| left.manufacturer.cmp(&right.manufacturer))
-    });
-
+    sort_cameras(&mut cameras);
     cameras
+}
+
+pub(crate) async fn discover_canon_cameras_in_mask(
+    mask: &str,
+) -> Result<Vec<NetworkCamera>, String> {
+    let scan_targets = scan_targets_from_mask(mask)?;
+    let mut cameras = discover_canon_cameras(&scan_targets).await;
+    sort_cameras(&mut cameras);
+    Ok(cameras)
 }
 
 pub(crate) async fn inspect_configured_camera(
@@ -175,6 +197,15 @@ fn deduplicate_devices(devices: Vec<DiscoveredDevice>) -> HashMap<String, Discov
     let mut unique = HashMap::new();
     merge_devices(&mut unique, devices);
     unique
+}
+
+fn sort_cameras(cameras: &mut [NetworkCamera]) {
+    cameras.sort_by(|left, right| {
+        left.address
+            .cmp(&right.address)
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.manufacturer.cmp(&right.manufacturer))
+    });
 }
 
 fn merge_devices(unique: &mut HashMap<String, DiscoveredDevice>, devices: Vec<DiscoveredDevice>) {
@@ -499,6 +530,35 @@ fn subnet_scan_targets() -> io::Result<Vec<Ipv4Addr>> {
     Ok(targets.into_iter().collect())
 }
 
+fn scan_targets_from_mask(mask: &str) -> Result<Vec<Ipv4Addr>, String> {
+    let trimmed = mask.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a network mask like 192.168.1.xxx.".to_owned());
+    }
+
+    let octets = trimmed.split('.').collect::<Vec<_>>();
+    if octets.len() != 4 {
+        return Err("Enter a network mask like 192.168.1.xxx.".to_owned());
+    }
+
+    let [first, second, third, fourth] = octets.as_slice() else {
+        return Err("Enter a network mask like 192.168.1.xxx.".to_owned());
+    };
+
+    let first = parse_mask_octet(first)?;
+    let second = parse_mask_octet(second)?;
+    let third = parse_mask_octet(third)?;
+    if !is_mask_wildcard(fourth) {
+        return Err(
+            "Only the final octet may be a wildcard, for example 192.168.1.xxx.".to_owned(),
+        );
+    }
+
+    Ok((1..=254)
+        .map(|host| Ipv4Addr::new(first, second, third, host))
+        .collect())
+}
+
 fn hosts_in_scan_range(ip: Ipv4Addr, prefixlen: u8) -> Vec<Ipv4Addr> {
     if prefixlen >= 31 {
         return Vec::new();
@@ -518,6 +578,28 @@ fn hosts_in_scan_range(ip: Ipv4Addr, prefixlen: u8) -> Vec<Ipv4Addr> {
         .map(Ipv4Addr::from)
         .filter(|candidate| *candidate != ip)
         .collect()
+}
+
+fn parse_mask_octet(octet: &str) -> Result<u8, String> {
+    octet
+        .parse::<u8>()
+        .map_err(|_| "Enter a network mask like 192.168.1.xxx.".to_owned())
+}
+
+fn is_mask_wildcard(value: &str) -> bool {
+    value == "*" || value.eq_ignore_ascii_case("xxx")
+}
+
+fn title_case_segment(segment: &str) -> String {
+    let mut characters = segment.chars();
+    let Some(first) = characters.next() else {
+        return String::new();
+    };
+
+    let mut value = String::new();
+    value.push(first.to_ascii_uppercase());
+    value.extend(characters);
+    value
 }
 
 #[derive(Debug, Deserialize)]
@@ -563,6 +645,30 @@ mod tests {
                 Ipv4Addr::new(192, 168, 1, 46),
             ]
         );
+    }
+
+    #[test]
+    fn expands_final_octet_scan_masks() {
+        let hosts = scan_targets_from_mask("192.168.1.xxx").unwrap();
+
+        assert_eq!(hosts.len(), 254);
+        assert_eq!(hosts.first(), Some(&Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(hosts.last(), Some(&Ipv4Addr::new(192, 168, 1, 254)));
+    }
+
+    #[test]
+    fn accepts_star_scan_masks() {
+        let hosts = scan_targets_from_mask("10.0.0.*").unwrap();
+
+        assert_eq!(hosts.len(), 254);
+        assert_eq!(hosts[0], Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn rejects_non_final_wildcards_in_scan_masks() {
+        let error = scan_targets_from_mask("192.168.xxx.1").unwrap_err();
+
+        assert_eq!(error, "Enter a network mask like 192.168.1.xxx.".to_owned());
     }
 
     #[test]
@@ -629,6 +735,18 @@ mod tests {
             normalize_manufacturer("Canon Inc.").as_deref(),
             Some("Canon")
         );
+    }
+
+    #[test]
+    fn suggests_sanitized_camera_names() {
+        let camera = NetworkCamera {
+            address: "192.168.1.23".to_owned(),
+            port: 80,
+            manufacturer: Some("Canon".to_owned()),
+            model: "CCAPI camera".to_owned(),
+        };
+
+        assert_eq!(suggest_camera_name(Some(&camera)), "CanonCCAPICamera");
     }
 
     #[test]
