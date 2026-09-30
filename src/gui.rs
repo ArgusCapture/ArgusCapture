@@ -2106,10 +2106,21 @@ fn present_album_dialog(
     content_area.set_margin_bottom(16);
     content_area.set_margin_start(24);
     content_area.set_margin_end(24);
+    content_area.set_vexpand(true);
+
+    // Keep the Close button in the bottom-right corner with some breathing room.
+    if let Some(close_button) = dialog.widget_for_response(ResponseType::Close) {
+        close_button.set_margin_end(10);
+        close_button.set_margin_bottom(6);
+        close_button.set_halign(Align::End);
+        close_button.set_valign(Align::End);
+    }
 
     if media_paths.is_empty() {
         let empty_label = Label::new(Some("No captured media found in the workspace."));
         empty_label.set_halign(Align::Start);
+        empty_label.set_valign(Align::Start);
+        empty_label.set_vexpand(true);
         empty_label.set_wrap(true);
         content_area.append(&empty_label);
     } else {
