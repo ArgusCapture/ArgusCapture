@@ -34,8 +34,9 @@ use gtk::glib::{self, ControlFlow, SourceId};
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, Dialog, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, GestureClick, Grid, Label, Orientation, Overlay,
-    Picture, PopoverMenuBar, ResponseType, SpinButton, Stack, StackSwitcher, StringList, Switch,
+    Entry, FileChooserAction, FileChooserNative, GestureClick, Grid, Label, ListBox, Orientation,
+    Overlay, Picture, PopoverMenuBar, ResponseType, ScrolledWindow, SpinButton, Stack,
+    StackSwitcher, StringList, Switch,
 };
 use serde_json::Value;
 use tokio::runtime::Builder;
@@ -53,6 +54,8 @@ const LOGO_64X64: &[u8] = include_bytes!("../doc/logo/logo-64x64.png");
 const LOGO_128X128: &[u8] = include_bytes!("../doc/logo/logo-128x128.png");
 const LOGO_256X256: &[u8] = include_bytes!("../doc/logo/logo-256x256.png");
 const LOGO_512X512: &[u8] = include_bytes!("../doc/logo/logo-512x512.png");
+const PICTURE_CONTENT_EXTENSIONS: &[&str] = &["jpg", "jpeg", "hif", "heif", "cr2", "cr3"];
+const VIDEO_CONTENT_EXTENSIONS: &[&str] = &["mp4", "mov", "crm"];
 
 struct LiveViewSession {
     stop: Arc<AtomicBool>,
@@ -360,6 +363,8 @@ fn build_ui(
     let capture_action = gio::SimpleAction::new("camera-capture", None);
     let focus_action = gio::SimpleAction::new("camera-focus", None);
     let configuration_action = gio::SimpleAction::new("edit-configuration", None);
+    let album_pictures_action = gio::SimpleAction::new("album-pictures", None);
+    let album_videos_action = gio::SimpleAction::new("album-videos", None);
     let about_action = gio::SimpleAction::new("help-about", None);
     let quit_action = gio::SimpleAction::new("quit", None);
 
@@ -368,6 +373,8 @@ fn build_ui(
     application.add_action(&capture_action);
     application.add_action(&focus_action);
     application.add_action(&configuration_action);
+    application.add_action(&album_pictures_action);
+    application.add_action(&album_videos_action);
     application.add_action(&about_action);
     application.add_action(&quit_action);
 
@@ -419,6 +426,34 @@ fn build_ui(
         let application = application.clone();
         quit_action.connect_activate(move |_, _| {
             application.quit();
+        });
+    }
+
+    {
+        let window = window.clone();
+        let workspace = workspace.clone();
+        let status_label = status_label.clone();
+        album_pictures_action.connect_activate(move |_, _| {
+            present_album_dialog(
+                &window,
+                CapturedMediaKind::Picture,
+                &workspace.borrow(),
+                &status_label,
+            );
+        });
+    }
+
+    {
+        let window = window.clone();
+        let workspace = workspace.clone();
+        let status_label = status_label.clone();
+        album_videos_action.connect_activate(move |_, _| {
+            present_album_dialog(
+                &window,
+                CapturedMediaKind::Video,
+                &workspace.borrow(),
+                &status_label,
+            );
         });
     }
 
@@ -1344,6 +1379,11 @@ fn build_menu_bar_row() -> GtkBox {
     edit_menu.append(Some("Configuration"), Some("app.edit-configuration"));
     left_root.append_submenu(Some("Edit"), &edit_menu);
 
+    let album_menu = gio::Menu::new();
+    album_menu.append(Some("Pictures"), Some("app.album-pictures"));
+    album_menu.append(Some("Videos"), Some("app.album-videos"));
+    left_root.append_submenu(Some("Album"), &album_menu);
+
     let camera_menu = gio::Menu::new();
     camera_menu.append(Some("Connect"), Some("app.camera-connect"));
     camera_menu.append(Some("Disconnect"), Some("app.camera-disconnect"));
@@ -2035,6 +2075,323 @@ fn present_capture_result_dialog(
         dialog.close();
     });
     dialog.present();
+}
+
+fn present_album_dialog(
+    parent: &ApplicationWindow,
+    media_kind: CapturedMediaKind,
+    workspace: &Path,
+    status_label: &Label,
+) {
+    let media_paths = match collect_workspace_media(workspace, media_kind) {
+        Ok(paths) => paths,
+        Err(error) => {
+            status_label.set_text(&format!("Failed to load album: {error}"));
+            return;
+        }
+    };
+
+    let dialog = Dialog::builder()
+        .title(album_dialog_title(media_kind))
+        .transient_for(parent)
+        .modal(true)
+        .default_width(720)
+        .default_height(420)
+        .build();
+    dialog.add_button("Close", ResponseType::Close);
+
+    let content_area = dialog.content_area();
+    content_area.set_spacing(12);
+    content_area.set_margin_top(16);
+    content_area.set_margin_bottom(16);
+    content_area.set_margin_start(24);
+    content_area.set_margin_end(24);
+
+    if media_paths.is_empty() {
+        let empty_label = Label::new(Some("No captured media found in the workspace."));
+        empty_label.set_halign(Align::Start);
+        empty_label.set_wrap(true);
+        content_area.append(&empty_label);
+    } else {
+        let scroller = ScrolledWindow::builder()
+            .min_content_width(640)
+            .min_content_height(320)
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .build();
+        let list = ListBox::new();
+        list.set_activate_on_single_click(false);
+
+        let paths = Rc::new(RefCell::new(media_paths));
+        for path in paths.borrow().iter() {
+            let row = gtk::ListBoxRow::new();
+            let row_content = GtkBox::new(Orientation::Horizontal, 12);
+            row_content.set_margin_top(8);
+            row_content.set_margin_bottom(8);
+            row_content.set_margin_start(12);
+            row_content.set_margin_end(12);
+            row_content.set_hexpand(true);
+
+            let text_column = GtkBox::new(Orientation::Vertical, 4);
+            text_column.set_hexpand(true);
+
+            let title = Label::new(Some(&media_display_name(path)));
+            title.set_halign(Align::Start);
+            title.set_xalign(0.0);
+            title.set_hexpand(true);
+
+            let full_path = Label::new(Some(&path.display().to_string()));
+            full_path.set_halign(Align::Start);
+            full_path.set_xalign(0.0);
+            full_path.set_wrap(true);
+            full_path.add_css_class("dim-label");
+            full_path.set_hexpand(true);
+
+            text_column.append(&title);
+            text_column.append(&full_path);
+            row_content.append(&text_column);
+
+            let buttons = GtkBox::new(Orientation::Horizontal, 6);
+            let view_button = Button::builder()
+                .icon_name("document-open-symbolic")
+                .tooltip_text("View")
+                .build();
+            let delete_button = Button::builder()
+                .icon_name("user-trash-symbolic")
+                .tooltip_text("Delete")
+                .build();
+            buttons.append(&view_button);
+            buttons.append(&delete_button);
+            row_content.append(&buttons);
+
+            {
+                let status_label = status_label.clone();
+                let path = path.clone();
+                view_button.connect_clicked(move |_| {
+                    open_album_media_path(&path, &status_label);
+                });
+            }
+
+            {
+                let status_label = status_label.clone();
+                let path = path.clone();
+                let paths = paths.clone();
+                let list = list.clone();
+                let row = row.clone();
+                delete_button.connect_clicked(move |_| match fs::remove_file(&path) {
+                    Ok(()) => {
+                        status_label.set_text(&format!("Deleted {}", path.display()));
+                        let index = row.index();
+                        list.remove(&row);
+                        if let Ok(index) = usize::try_from(index) {
+                            let mut paths = paths.borrow_mut();
+                            if index < paths.len() {
+                                paths.remove(index);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        status_label
+                            .set_text(&format!("Failed to delete {}: {error}", path.display()));
+                    }
+                });
+            }
+
+            row.set_child(Some(&row_content));
+            list.append(&row);
+        }
+
+        let status_label = status_label.clone();
+        let paths_for_activation = paths.clone();
+        list.connect_row_activated(move |_, row| {
+            let index = row.index();
+            let Some(path) = usize::try_from(index)
+                .ok()
+                .and_then(|index| paths_for_activation.borrow().get(index).cloned())
+            else {
+                status_label.set_text("Unable to open the selected media path.");
+                return;
+            };
+
+            open_album_media_path(&path, &status_label);
+        });
+
+        scroller.set_child(Some(&list));
+        content_area.append(&scroller);
+    }
+
+    dialog.connect_response(|dialog, _| {
+        dialog.close();
+    });
+    dialog.present();
+}
+
+fn album_dialog_title(media_kind: CapturedMediaKind) -> &'static str {
+    match media_kind {
+        CapturedMediaKind::Picture => "Pictures",
+        CapturedMediaKind::Video => "Videos",
+    }
+}
+
+fn collect_workspace_media(
+    workspace: &Path,
+    media_kind: CapturedMediaKind,
+) -> Result<Vec<PathBuf>, String> {
+    if !workspace.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut stack = vec![workspace.to_path_buf()];
+    let mut media_paths = Vec::new();
+
+    while let Some(directory) = stack.pop() {
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("failed to read {}: {error}", directory.display()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed to read directory entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if workspace_media_matches_kind(&path, media_kind) {
+                media_paths.push(path);
+            }
+        }
+    }
+
+    media_paths.sort();
+    media_paths.reverse();
+    Ok(media_paths)
+}
+
+fn media_display_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn open_album_media_path(path: &Path, status_label: &Label) {
+    let absolute_path = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) => {
+            status_label.set_text(&format!("Failed to resolve {}: {error}", path.display()));
+            return;
+        }
+    };
+
+    if workspace_media_matches_kind(&absolute_path, CapturedMediaKind::Video) {
+        match open_video_media_path(&absolute_path) {
+            Ok(launcher_name) => {
+                status_label.set_text(&format!(
+                    "Opened {} via {launcher_name}",
+                    absolute_path.display()
+                ));
+                return;
+            }
+            Err(video_error) => {
+                log_live_view(format!(
+                    "video player launch failed for {}: {video_error}",
+                    absolute_path.display()
+                ));
+            }
+        }
+    }
+
+    let file = gio::File::for_path(&absolute_path);
+    let uri = file.uri();
+
+    match gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
+        Ok(()) => status_label.set_text(&format!("Opened {}", absolute_path.display())),
+        Err(gio_error) => match opener::open(&absolute_path) {
+            Ok(()) => status_label.set_text(&format!("Opened {}", absolute_path.display())),
+            Err(opener_error) => match open_media_path_with_desktop_command(&absolute_path) {
+                Ok(launcher_name) => status_label.set_text(&format!(
+                    "Opened {} via {launcher_name}",
+                    absolute_path.display()
+                )),
+                Err(command_error) => {
+                    status_label.set_text(&format!(
+                        "Failed to open {}: {gio_error}; opener fallback failed: {opener_error}; desktop launcher fallback failed: {command_error}",
+                        absolute_path.display()
+                    ));
+                }
+            },
+        },
+    }
+}
+
+fn open_video_media_path(path: &Path) -> Result<&'static str, String> {
+    for (launcher_name, command, extra_args) in [
+        ("mpv", "mpv", &[][..]),
+        ("vlc", "vlc", &[][..]),
+        ("totem", "totem", &[][..]),
+        ("mplayer", "mplayer", &[][..]),
+        ("ffplay", "ffplay", &["-autoexit"][..]),
+    ] {
+        let mut child = Command::new(command);
+        child
+            .args(extra_args)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        match child.spawn() {
+            Ok(_) => return Ok(launcher_name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log_live_view(format!(
+                    "{launcher_name} unavailable for {}: {error}",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                log_live_view(format!(
+                    "{launcher_name} failed for {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Err("no supported video player command succeeded".to_owned())
+}
+
+fn open_media_path_with_desktop_command(path: &Path) -> Result<&'static str, String> {
+    for (launcher_name, command) in [
+        (
+            "gio open",
+            ("gio", vec!["open".to_owned(), path.display().to_string()]),
+        ),
+        ("xdg-open", ("xdg-open", vec![path.display().to_string()])),
+    ] {
+        match Command::new(command.0).args(&command.1).status() {
+            Ok(status) if status.success() => return Ok(launcher_name),
+            Ok(status) => {
+                let code = status.code().map_or_else(
+                    || "terminated by signal".to_owned(),
+                    |code| code.to_string(),
+                );
+                log_live_view(format!(
+                    "{launcher_name} failed for {} with status {code}",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                log_live_view(format!(
+                    "{launcher_name} unavailable for {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Err("no desktop launcher succeeded".to_owned())
 }
 
 fn attach_form_row<W: IsA<gtk::Widget>>(grid: &Grid, row: i32, label: &str, widget: &W) {
@@ -4080,9 +4437,9 @@ fn filter_added_contents_by_media_kind(
         .into_iter()
         .filter(|content| match media_kind {
             CapturedMediaKind::Picture => {
-                has_content_extension(content, &["jpg", "jpeg", "hif", "heif", "cr2", "cr3"])
+                has_content_extension(content, PICTURE_CONTENT_EXTENSIONS)
             }
-            CapturedMediaKind::Video => has_content_extension(content, &["mp4", "mov", "crm"]),
+            CapturedMediaKind::Video => has_content_extension(content, VIDEO_CONTENT_EXTENSIONS),
         })
         .collect()
 }
@@ -4092,6 +4449,18 @@ fn has_content_extension(content_path: &str, extensions: &[&str]) -> bool {
     extensions
         .iter()
         .any(|extension| lower.ends_with(&format!(".{extension}")))
+}
+
+fn workspace_media_matches_kind(path: &Path, media_kind: CapturedMediaKind) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    let extensions = match media_kind {
+        CapturedMediaKind::Picture => PICTURE_CONTENT_EXTENSIONS,
+        CapturedMediaKind::Video => VIDEO_CONTENT_EXTENSIONS,
+    };
+    extensions.iter().any(|candidate| extension == *candidate)
 }
 
 fn download_contents_to_workspace(

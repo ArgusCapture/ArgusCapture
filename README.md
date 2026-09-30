@@ -36,6 +36,7 @@ Argus Capture is named after [Argus](https://en.wikipedia.org/wiki/Argus_Panopte
 - Focus controls, including AF trigger, focus-point movement, and click-to-focus in live view
 - Still photo capture
 - Video recording start/stop from the same capture control
+- Album menu for browsing captured pictures and videos from the workspace
 - Capture result pop-up showing the saved picture/video path
 - Automatic download and optional camera-side deletion based on storage policy
 - Embedded application logo used inside the binary
