@@ -1742,7 +1742,27 @@ fn present_configuration_dialog(
         .text(current.password.as_deref().unwrap_or_default())
         .hexpand(true)
         .visibility(false)
+        .secondary_icon_name("view-reveal-symbolic")
+        .secondary_icon_activatable(true)
+        .secondary_icon_tooltip_text("Show password")
         .build();
+    password_entry.connect_icon_press(|entry, position| {
+        if position != gtk::EntryIconPosition::Secondary {
+            return;
+        }
+        let show = !entry.property::<bool>("visibility");
+        entry.set_visibility(show);
+        entry.set_secondary_icon_name(Some(if show {
+            "view-conceal-symbolic"
+        } else {
+            "view-reveal-symbolic"
+        }));
+        entry.set_secondary_icon_tooltip_text(Some(if show {
+            "Hide password"
+        } else {
+            "Show password"
+        }));
+    });
     let scan_mask_entry = Entry::builder()
         .text(default_camera_scan_mask(&current.host))
         .placeholder_text("192.168.1.xxx")
