@@ -47,6 +47,7 @@ use crate::network::{self, NetworkCamera};
 const APP_ID: &str = "org.arguscapture.ArgusCapture";
 const APP_NAME: &str = "Argus Capture";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LICENSE_TEXT: &str = include_str!("../LICENSE");
 const LIVE_VIEW_STREAM: &str = "/brapi/shooting/lvscrolldetail?liveviewsize=medium";
 const LOGO_16X16: &[u8] = include_bytes!("../doc/logo/logo-16x16.png");
 const LOGO_32X32: &[u8] = include_bytes!("../doc/logo/logo-32x32.png");
@@ -365,8 +366,19 @@ fn build_ui(
     let configuration_action = gio::SimpleAction::new("edit-configuration", None);
     let album_pictures_action = gio::SimpleAction::new("album-pictures", None);
     let album_videos_action = gio::SimpleAction::new("album-videos", None);
-    let about_action = gio::SimpleAction::new("help-about", None);
     let quit_action = gio::SimpleAction::new("quit", None);
+    let license_action = gio::SimpleAction::new("help-license", None);
+    let about_action = gio::SimpleAction::new("help-about", None);
+
+    application.add_action(&license_action);
+    application.add_action(&about_action);
+
+    {
+        let window = window.clone();
+        license_action.connect_activate(move |_, _| {
+            present_license_dialog(&window);
+        });
+    }
 
     application.add_action(&connect_action);
     application.add_action(&disconnect_action);
@@ -383,6 +395,7 @@ fn build_ui(
     application.set_accels_for_action("app.camera-disconnect", &["d"]);
     application.set_accels_for_action("app.camera-capture", &["p"]);
     application.set_accels_for_action("app.camera-focus", &["f"]);
+    application.set_accels_for_action("app.help-license", &["l"]);
     application.set_accels_for_action("app.help-about", &["a"]);
 
     let connected_view = build_content_view(focus_overlay_state.clone());
@@ -1400,6 +1413,7 @@ fn build_menu_bar_row() -> GtkBox {
 
     let right_root = gio::Menu::new();
     let help_menu = gio::Menu::new();
+    help_menu.append(Some("License"), Some("app.help-license"));
     help_menu.append(Some("About"), Some("app.help-about"));
     right_root.append_submenu(Some("Help"), &help_menu);
 
@@ -1657,6 +1671,50 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
         aperture_label,
         aperture_dropdown,
     }
+}
+
+fn present_license_dialog(parent: &ApplicationWindow) {
+    let dialog = Dialog::builder()
+        .title("License")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(600)
+        .default_height(450)
+        .build();
+
+    dialog.add_button("Close", ResponseType::Close);
+
+    let content_area = dialog.content_area();
+    content_area.set_margin_top(12);
+    content_area.set_margin_bottom(12);
+    content_area.set_margin_start(12);
+    content_area.set_margin_end(12);
+
+    let scrolled_window = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+
+    let text_view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::Word)
+        .monospace(true)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+
+    text_view.buffer().set_text(LICENSE_TEXT);
+    scrolled_window.set_child(Some(&text_view));
+    content_area.append(&scrolled_window);
+
+    dialog.connect_response(|dialog, _| {
+        dialog.close();
+    });
+
+    dialog.present();
 }
 
 fn present_configuration_dialog(
