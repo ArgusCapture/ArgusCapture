@@ -41,7 +41,7 @@ use gtk::{
 use serde_json::Value;
 use tokio::runtime::Builder;
 
-use crate::config::{self, AppConfig, ConfiguredCamera, StorageMode};
+use crate::config::{self, AppConfig, ConfiguredCamera, Shortcuts, StorageMode};
 use crate::network::{self, NetworkCamera};
 
 const APP_ID: &str = "org.arguscapture.ArgusCapture";
@@ -316,6 +316,7 @@ pub(crate) fn run(config: Option<&AppConfig>) {
     let configured_camera = Rc::new(RefCell::new(initial_camera_config(config)));
     let workspace = Rc::new(RefCell::new(initial_workspace(config)));
     let storage = Rc::new(Cell::new(initial_storage(config)));
+    let shortcuts = Rc::new(RefCell::new(initial_shortcuts(config)));
 
     application.connect_activate(move |application| {
         build_ui(
@@ -323,6 +324,7 @@ pub(crate) fn run(config: Option<&AppConfig>) {
             configured_camera.clone(),
             workspace.clone(),
             storage.clone(),
+            shortcuts.clone(),
         );
     });
 
@@ -334,6 +336,7 @@ fn build_ui(
     configured_camera: Rc<RefCell<ConfiguredCamera>>,
     workspace: Rc<RefCell<PathBuf>>,
     storage: Rc<Cell<StorageMode>>,
+    shortcuts: Rc<RefCell<Shortcuts>>,
 ) {
     let window = ApplicationWindow::builder()
         .application(application)
@@ -397,6 +400,8 @@ fn build_ui(
     application.set_accels_for_action("app.camera-focus", &["f"]);
     application.set_accels_for_action("app.help-license", &["l"]);
     application.set_accels_for_action("app.help-about", &["a"]);
+
+    apply_shortcuts(application, &shortcuts.borrow());
 
     let connected_view = build_content_view(focus_overlay_state.clone());
     let capture_settings_controls = CaptureSettingsControls {
@@ -1347,6 +1352,7 @@ fn build_ui(
         let configured_camera = configured_camera.clone();
         let workspace = workspace.clone();
         let storage = storage.clone();
+        let shortcuts = shortcuts.clone();
         let status_label = status_label.clone();
         let window = window.clone();
         configuration_action.connect_activate(move |_, _| {
@@ -1354,6 +1360,7 @@ fn build_ui(
                 &window,
                 workspace.clone(),
                 storage.clone(),
+                shortcuts.clone(),
                 configured_camera.clone(),
                 &status_label,
             );
@@ -1721,6 +1728,7 @@ fn present_configuration_dialog(
     parent: &ApplicationWindow,
     workspace: Rc<RefCell<PathBuf>>,
     storage: Rc<Cell<StorageMode>>,
+    shortcuts: Rc<RefCell<Shortcuts>>,
     configured_camera: Rc<RefCell<ConfiguredCamera>>,
     status_label: &Label,
 ) {
@@ -1854,6 +1862,170 @@ fn present_configuration_dialog(
 
     tabs.add_titled(&general_page, Some("general"), "General");
     tabs.add_titled(&camera_page, Some("camera"), "Camera");
+
+    // --- Keyboard shortcuts tab -------------------------------------------
+    let app_handle = parent.application();
+    let pending_shortcuts = Rc::new(RefCell::new(shortcuts.borrow().clone()));
+    let recording: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+
+    let shortcut_grid = Grid::builder()
+        .column_spacing(12)
+        .row_spacing(8)
+        .hexpand(true)
+        .build();
+    let mut shortcut_name_list = Vec::new();
+    let mut shortcut_button_list = Vec::new();
+    for (index, def) in config::SHORTCUT_DEFS.iter().enumerate() {
+        let name_label = Label::new(Some(&def.title()));
+        name_label.set_halign(Align::Start);
+        name_label.set_xalign(0.0);
+        name_label.set_width_chars(22);
+        let button = Button::with_label(&config::display_accelerator(
+            pending_shortcuts.borrow().accel(def.action),
+        ));
+        button.set_hexpand(true);
+        shortcut_grid.attach(&name_label, 0, index as i32, 1, 1);
+        shortcut_grid.attach(&button, 1, index as i32, 1, 1);
+        shortcut_name_list.push(name_label);
+        shortcut_button_list.push(button);
+    }
+    let shortcut_names = Rc::new(shortcut_name_list);
+    let shortcut_buttons = Rc::new(shortcut_button_list);
+
+    let shortcut_search = gtk::SearchEntry::new();
+    shortcut_search.set_hexpand(true);
+
+    let no_shortcut_matches = Label::new(Some("No menu items match your search."));
+    no_shortcut_matches.set_halign(Align::Start);
+    no_shortcut_matches.add_css_class("dim-label");
+    no_shortcut_matches.set_visible(false);
+
+    let shortcut_hint = Label::new(Some(
+        "Search for a menu item by name, menu or shortcut. Click its shortcut, then press the new key combination. Backspace clears it, Esc cancels.",
+    ));
+    shortcut_hint.set_halign(Align::Start);
+    shortcut_hint.set_xalign(0.0);
+    shortcut_hint.set_wrap(true);
+    shortcut_hint.add_css_class("dim-label");
+
+    let reset_shortcuts_button = Button::with_label("Reset to defaults");
+    reset_shortcuts_button.set_halign(Align::End);
+
+    let shortcuts_scroller = ScrolledWindow::builder()
+        .min_content_height(240)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+    shortcuts_scroller.set_child(Some(&shortcut_grid));
+
+    let shortcuts_page = GtkBox::new(Orientation::Vertical, 12);
+    shortcuts_page.set_margin_top(12);
+    shortcuts_page.append(&shortcut_search);
+    shortcuts_page.append(&shortcut_hint);
+    shortcuts_page.append(&no_shortcut_matches);
+    shortcuts_page.append(&shortcuts_scroller);
+    shortcuts_page.append(&reset_shortcuts_button);
+    tabs.add_titled(&shortcuts_page, Some("shortcuts"), "Shortcuts");
+
+    // Ends a recording and puts the saved shortcuts back in force. Recording
+    // suspends all application shortcuts so the key being captured cannot
+    // trigger an action (for example `q` quitting the app).
+    let stop_recording: Rc<dyn Fn()> = {
+        let recording = recording.clone();
+        let pending = pending_shortcuts.clone();
+        let buttons = shortcut_buttons.clone();
+        let saved = shortcuts.clone();
+        let application = app_handle.clone();
+        Rc::new(move || {
+            recording.set(None);
+            refresh_shortcut_buttons(&buttons, &pending.borrow(), None);
+            if let Some(application) = application.as_ref() {
+                apply_shortcuts(application, &saved.borrow());
+            }
+        })
+    };
+
+    for (index, button) in shortcut_buttons.iter().enumerate() {
+        {
+            let recording = recording.clone();
+            let pending = pending_shortcuts.clone();
+            let buttons = shortcut_buttons.clone();
+            let application = app_handle.clone();
+            button.connect_clicked(move |_| {
+                recording.set(Some(index));
+                refresh_shortcut_buttons(&buttons, &pending.borrow(), Some(index));
+                if let Some(application) = application.as_ref() {
+                    clear_shortcut_accels(application);
+                }
+            });
+        }
+
+        {
+            let key_controller = gtk::EventControllerKey::new();
+            key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let recording = recording.clone();
+            let pending = pending_shortcuts.clone();
+            let stop_recording = stop_recording.clone();
+            key_controller.connect_key_pressed(move |_, keyval, _, state| {
+                if recording.get() != Some(index) {
+                    return glib::Propagation::Proceed;
+                }
+
+                let action = config::SHORTCUT_DEFS[index].action;
+                if keyval == gtk::gdk::Key::Escape {
+                    stop_recording();
+                } else if keyval == gtk::gdk::Key::BackSpace {
+                    pending.borrow_mut().set(action, "");
+                    stop_recording();
+                } else if let Some(accel) = accel_from_key_event(keyval, state) {
+                    pending.borrow_mut().set(action, &accel);
+                    stop_recording();
+                }
+                // Modifier-only presses are ignored and recording continues.
+                glib::Propagation::Stop
+            });
+            button.add_controller(key_controller);
+        }
+
+        {
+            let focus_controller = gtk::EventControllerFocus::new();
+            let recording = recording.clone();
+            let stop_recording = stop_recording.clone();
+            focus_controller.connect_leave(move |_| {
+                if recording.get() == Some(index) {
+                    stop_recording();
+                }
+            });
+            button.add_controller(focus_controller);
+        }
+    }
+
+    {
+        let pending = pending_shortcuts.clone();
+        let names = shortcut_names.clone();
+        let buttons = shortcut_buttons.clone();
+        let no_matches = no_shortcut_matches.clone();
+        shortcut_search.connect_search_changed(move |entry| {
+            filter_shortcut_rows(
+                entry.text().as_str(),
+                &names,
+                &buttons,
+                &pending.borrow(),
+                &no_matches,
+            );
+        });
+    }
+
+    {
+        let pending = pending_shortcuts.clone();
+        let buttons = shortcut_buttons.clone();
+        let recording = recording.clone();
+        reset_shortcuts_button.connect_clicked(move |_| {
+            *pending.borrow_mut() = Shortcuts::default();
+            refresh_shortcut_buttons(&buttons, &pending.borrow(), recording.get());
+        });
+    }
     content_area.append(&switcher);
     content_area.append(&tabs);
 
@@ -1993,10 +2165,15 @@ fn present_configuration_dialog(
 
     let workspace_state = workspace.clone();
     let storage_state = storage.clone();
+    let shortcuts_state = shortcuts.clone();
     let configured_camera_state = configured_camera.clone();
     let status_label = status_label.clone();
+    let tabs_for_response = tabs.clone();
+    let shortcut_hint_for_response = shortcut_hint.clone();
     dialog.connect_response(move |dialog, response| {
         if response != ResponseType::Accept {
+            // Make sure shortcuts suspended by an unfinished recording come back.
+            stop_recording();
             dialog.close();
             return;
         }
@@ -2036,12 +2213,28 @@ fn present_configuration_dialog(
         };
         let workspace = PathBuf::from(workspace_text);
         let storage = storage_mode_from_index(storage_dropdown.selected());
+        let new_shortcuts = pending_shortcuts.borrow().clone();
 
-        match save_configuration(&workspace, storage, &camera) {
+        if let Some((first, second)) = new_shortcuts.conflict() {
+            let message = format!(
+                "The shortcut {} is used by both {} and {}.",
+                config::display_accelerator(new_shortcuts.accel(first.action)),
+                first.title(),
+                second.title()
+            );
+            tabs_for_response.set_visible_child_name("shortcuts");
+            shortcut_hint_for_response.set_text(&message);
+            status_label.set_text(&message);
+            return;
+        }
+
+        match save_configuration(&workspace, storage, &camera, &new_shortcuts) {
             Ok(()) => {
                 *workspace_state.borrow_mut() = workspace;
                 storage_state.set(storage);
                 *configured_camera_state.borrow_mut() = camera;
+                *shortcuts_state.borrow_mut() = new_shortcuts;
+                stop_recording();
                 status_label.set_text("Configuration saved.");
                 dialog.close();
             }
@@ -2548,12 +2741,84 @@ fn save_configuration(
     workspace: &Path,
     storage: StorageMode,
     camera: &ConfiguredCamera,
+    shortcuts: &Shortcuts,
 ) -> io::Result<()> {
     let path = config::user_config_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    config::write_user_config(&path, workspace, storage, camera)
+    config::write_user_config(&path, workspace, storage, camera, shortcuts)
+}
+
+fn initial_shortcuts(config: Option<&AppConfig>) -> Shortcuts {
+    config
+        .map(|app_config| app_config.shortcuts().clone())
+        .unwrap_or_default()
+}
+
+// Registers every configured shortcut with GTK; unassigned actions get none.
+fn apply_shortcuts(application: &Application, shortcuts: &Shortcuts) {
+    for def in config::SHORTCUT_DEFS {
+        let action = format!("app.{}", def.action);
+        let accel = shortcuts.accel(def.action);
+        if accel.is_empty() {
+            application.set_accels_for_action(&action, &[]);
+        } else {
+            application.set_accels_for_action(&action, &[accel]);
+        }
+    }
+}
+
+fn clear_shortcut_accels(application: &Application) {
+    for def in config::SHORTCUT_DEFS {
+        application.set_accels_for_action(&format!("app.{}", def.action), &[]);
+    }
+}
+
+// Shows only the shortcut rows that match the search text.
+fn filter_shortcut_rows(
+    query: &str,
+    names: &[Label],
+    buttons: &[Button],
+    shortcuts: &Shortcuts,
+    no_matches: &Label,
+) {
+    let mut visible = 0;
+
+    for ((name, button), def) in names.iter().zip(buttons).zip(config::SHORTCUT_DEFS) {
+        let show = config::shortcut_matches(def, shortcuts.accel(def.action), query);
+        name.set_visible(show);
+        button.set_visible(show);
+        if show {
+            visible += 1;
+        }
+    }
+
+    no_matches.set_visible(visible == 0);
+}
+
+fn refresh_shortcut_buttons(buttons: &[Button], shortcuts: &Shortcuts, recording: Option<usize>) {
+    for (index, (button, def)) in buttons.iter().zip(config::SHORTCUT_DEFS).enumerate() {
+        if recording == Some(index) {
+            button.set_label("Press a shortcut...");
+        } else {
+            button.set_label(&config::display_accelerator(shortcuts.accel(def.action)));
+        }
+    }
+}
+
+// Turns a key press into a GTK accelerator string such as `<Control>p`.
+// Returns None for presses that cannot be a shortcut (for example Shift alone).
+fn accel_from_key_event(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<String> {
+    let modifiers = state
+        & (gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK
+            | gtk::gdk::ModifierType::SHIFT_MASK
+            | gtk::gdk::ModifierType::SUPER_MASK);
+    let key = keyval.to_lower();
+
+    gtk::accelerator_valid(key, modifiers)
+        .then(|| gtk::accelerator_name(key, modifiers).to_string())
 }
 
 fn initial_camera_config(config: Option<&AppConfig>) -> ConfiguredCamera {

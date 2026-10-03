@@ -31,6 +31,7 @@ Argus Capture is named after [Argus](https://en.wikipedia.org/wiki/Argus_Panopte
 - Camera configuration editor with General and Camera tabs, including Canon network-mask scanning
 - Configurable workspace directory for downloaded captures
 - Configurable storage policies: camera only, workspace only, or both
+- Configuration for defining keyboard shortcuts for menu items
 - Browser Remote / CCAPI-based network camera control
 - Live view preview in the main window
 - Focus controls, including AF trigger, focus-point movement, and click-to-focus in live view

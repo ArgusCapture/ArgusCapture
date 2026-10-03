@@ -85,6 +85,7 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
         std::path::Path::new(&workspace),
         storage,
         &configured_camera,
+        &config::Shortcuts::default(),
     )?;
     println!("Created {}", config_path.display());
 
