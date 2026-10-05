@@ -39,7 +39,7 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --all --check
 
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -76,6 +76,41 @@ jobs:
           components: clippy
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build-windows:
+    runs-on: windows-latest
+    env:
+      IOLIBRARY_PATH: /ucrt64/lib
+      LIBCLANG_PATH: /ucrt64/bin
+      PKG_CONFIG_PATH: /ucrt64/lib/pkgconfig
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install MSYS2 native dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-libgphoto2
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-gtk4
+
+      - name: Install stable GNU toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo build
+        run: cargo build --verbose
 
   audit:
     runs-on: ubuntu-latest

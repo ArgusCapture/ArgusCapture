@@ -126,6 +126,16 @@ A sample configuration is available at `doc/etc/argus-capture.conf`.
 - `doc/BROWSER_REMOTE.md` - Browser Remote reverse-engineering notes
 - `doc/CAMERA_API.md` - Implementation focused camera API guide for the GTK UI
 
+## Tested Platforms
+
+CI verifies builds and runs tests on every push across:
+
+| Operating System | CI Runner |
+| :--- | :--- |
+| Linux | `ubuntu-latest` |
+| Windows | `windows-latest` |
+
+
 ## Contributing
 
 Contributions to **Argus Capture** are managed on [GitHub.com](https://github.com/ArgusCapture/ArgusCapture/)
