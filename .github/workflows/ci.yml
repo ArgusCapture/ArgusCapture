@@ -49,7 +49,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config \
+            cmake \
             libglib2.0-dev \
+            libasound2-dev \
             libgtk-4-dev \
             libgphoto2-dev
       - name: Install stable toolchain
@@ -67,7 +69,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config \
+            cmake \
             libglib2.0-dev \
+            libasound2-dev \
             libgtk-4-dev \
             libgphoto2-dev
       - name: Install stable toolchain
@@ -80,9 +84,10 @@ jobs:
   build-windows:
     runs-on: windows-latest
     env:
-      IOLIBRARY_PATH: /ucrt64/lib
-      LIBCLANG_PATH: /ucrt64/bin
-      PKG_CONFIG_PATH: /ucrt64/lib/pkgconfig
+      MSYS2_ARG_CONV_EXCL: "*"
+      CMAKE_GENERATOR: "Ninja"
+      # Fixed folder where we gather whisper/ggml static libs (see "Collect" step)
+      RUSTFLAGS: -L native=${{ github.workspace }}/native-libs
     defaults:
       run:
         shell: msys2 {0}
@@ -90,6 +95,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install MSYS2 native dependencies
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -99,8 +105,23 @@ jobs:
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-pkg-config
             mingw-w64-ucrt-x86_64-libgphoto2
-            mingw-w64-ucrt-x86_64-clang
             mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-clang-libs
+
+      - name: Set MSYS2 environment variables
+        shell: pwsh
+        run: |
+          $root = "${{ steps.msys2.outputs.msys2-location }}"
+          "LIBCLANG_PATH=$root\ucrt64\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PKG_CONFIG_PATH=/ucrt64/lib/pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\native-libs" | Out-Null
+
+      - name: Verify libclang
+        shell: pwsh
+        run: Get-ChildItem "$env:LIBCLANG_PATH\*clang*.dll"
 
       - name: Install stable GNU toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -109,6 +130,60 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      - name: Patch whisper-rs-sys for MinGW / GNU
+        shell: pwsh
+        run: |
+          $cargoHome = "$env:USERPROFILE\.cargo"
+          $targetDir = "$cargoHome\registry\src"
+          if (Test-Path $targetDir) {
+              $buildFiles = Get-ChildItem -Path $targetDir -Recurse -Filter "build.rs" | Where-Object { $_.FullName -like "*whisper-rs-sys*" }
+              if ($buildFiles) {
+                  foreach ($file in $buildFiles) {
+                      $content = Get-Content $file.FullName -Raw
+                      if ($content -match "/utf-8") {
+                          $newContent = $content -replace '/utf-8', ''
+                          Set-Content -Path $file.FullName -Value $newContent -NoNewline
+                          Write-Host "Successfully patched: $($file.FullName)"
+                      }
+                  }
+              }
+          }
+
+      # Pass 1: the build script (CMake) succeeds, but rustc may fail to link-find ggml.
+      # That's expected; we only need CMake's output to exist.
+      - name: Build whisper-rs-sys (pass 1, CMake output only)
+        continue-on-error: true
+        run: cargo build -p whisper-rs-sys --verbose
+
+      # ggml's CMakeLists strips the "lib" prefix on every WIN32 target (including MinGW),
+      # so CMake produces ggml.a / ggml-base.a / ggml-cpu.a. rustc looks for libggml.a,
+      # hence "could not find native static library `ggml`". Copy and add the prefix.
+      - name: Collect whisper/ggml static libs (add lib prefix)
+        shell: pwsh
+        run: |
+          $dest = "$env:GITHUB_WORKSPACE\native-libs"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $libs = Get-ChildItem -Path "target\debug\build\whisper-rs-sys-*\out" -Recurse -Include *.a -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '\\whisper\.cpp\\' }
+          foreach ($l in $libs) {
+              $name = $l.Name
+              if (-not $name.StartsWith("lib")) { $name = "lib$name" }
+              Write-Host "Found: $($l.FullName) -> $name"
+              Copy-Item $l.FullName -Destination (Join-Path $dest $name) -Force
+          }
+          Write-Host "=== native-libs contents ==="
+          Get-ChildItem $dest | ForEach-Object { $_.Name }
+          foreach ($required in "libwhisper.a","libggml.a","libggml-base.a","libggml-cpu.a") {
+              if (-not (Test-Path (Join-Path $dest $required))) {
+                  Write-Error "Missing $required - CMake did not produce it."
+                  exit 1
+              }
+          }
+
+      # Pass 2: full build; whisper-rs-sys build script is cached, rustc now finds the libs.
       - name: Run cargo build
         run: cargo build --verbose
 

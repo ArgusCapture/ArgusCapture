@@ -34,8 +34,8 @@ use gtk::glib::{self, ControlFlow, SourceId};
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, Dialog, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, GestureClick, Grid, Label, ListBox, Orientation,
-    Overlay, Picture, PopoverMenuBar, ResponseType, ScrolledWindow, SpinButton, Stack,
+    Entry, FileChooserAction, FileChooserNative, GestureClick, Grid, Image, Label, ListBox,
+    Orientation, Overlay, Picture, PopoverMenuBar, ResponseType, ScrolledWindow, SpinButton, Stack,
     StackSwitcher, StringList, Switch,
 };
 use serde_json::Value;
@@ -43,6 +43,7 @@ use tokio::runtime::Builder;
 
 use crate::config::{self, AppConfig, ConfiguredCamera, Shortcuts, StorageMode};
 use crate::network::{self, NetworkCamera};
+use crate::voice;
 
 const APP_ID: &str = "org.arguscapture.ArgusCapture";
 const APP_NAME: &str = "Argus Capture";
@@ -141,6 +142,7 @@ struct ConnectedView {
     live_view_picture: Picture,
     capture_mode_switch: Switch,
     capture_button: Button,
+    voice_button: Button,
     focus_overlay_area: DrawingArea,
     focus_operation_label: Label,
     focus_method_label: Label,
@@ -372,6 +374,7 @@ fn build_ui(
     let quit_action = gio::SimpleAction::new("quit", None);
     let license_action = gio::SimpleAction::new("help-license", None);
     let about_action = gio::SimpleAction::new("help-about", None);
+    let voice_action = gio::SimpleAction::new("voice-listen", None);
 
     application.add_action(&license_action);
     application.add_action(&about_action);
@@ -392,6 +395,18 @@ fn build_ui(
     application.add_action(&album_videos_action);
     application.add_action(&about_action);
     application.add_action(&quit_action);
+    application.add_action(&voice_action);
+
+    // Voice commands drive the connected camera, so they are only available
+    // once Connect has succeeded and the live view is showing. The Focus action
+    // is enabled only in that state, so Voice simply follows it.
+    voice_action.set_enabled(false);
+    {
+        let voice_action = voice_action.clone();
+        focus_action.connect_enabled_notify(move |focus_action| {
+            voice_action.set_enabled(focus_action.is_enabled());
+        });
+    }
 
     application.set_accels_for_action("app.quit", &["q"]);
     application.set_accels_for_action("app.camera-connect", &["c"]);
@@ -1374,6 +1389,114 @@ fn build_ui(
         });
     }
 
+    // Voice commands: press the shortcut to start listening, press it again to
+    // stop. The recording is recognized on a worker thread, and the result is
+    // routed through the same GIO actions as the menu and the shortcuts, so a
+    // disabled action (for example capture while disconnected) is ignored.
+    {
+        let application = application.clone();
+        let window = window.clone();
+        let status_label = status_label.clone();
+        let voice_button = connected_view.voice_button.clone();
+        let recorder: Rc<RefCell<Option<voice::Recorder>>> = Rc::new(RefCell::new(None));
+        let recognizing = Rc::new(Cell::new(false));
+
+        // If the camera disconnects while listening, the voice action becomes
+        // disabled and could no longer be used to stop the recording. Stop the
+        // microphone instead of leaving it open.
+        {
+            let recorder = recorder.clone();
+            let voice_button = voice_button.clone();
+            voice_action.connect_enabled_notify(move |action| {
+                if !action.is_enabled() && recorder.borrow_mut().take().is_some() {
+                    set_voice_button_listening(&voice_button, false);
+                }
+            });
+        }
+
+        voice_action.connect_activate(move |_, _| {
+            if recognizing.get() {
+                return;
+            }
+
+            let active_recorder = recorder.borrow_mut().take();
+            let Some(active_recorder) = active_recorder else {
+                // Do not start listening when there is no model to recognize
+                // with; offer the download instead.
+                if !voice::is_voice_ready() {
+                    prompt_voice_model_download(&window, &status_label);
+                    return;
+                }
+
+                match voice::Recorder::start() {
+                    Ok(started) => {
+                        *recorder.borrow_mut() = Some(started);
+                        set_voice_button_listening(&voice_button, true);
+                        status_label
+                            .set_text("Listening... press the voice shortcut again to stop.");
+                    }
+                    Err(error) => status_label.set_text(&format!("Voice input error: {error}")),
+                }
+                return;
+            };
+
+            set_voice_button_listening(&voice_button, false);
+            let samples = active_recorder.finish();
+            if voice::is_probably_silence(&samples) {
+                status_label.set_text("No speech detected.");
+                return;
+            }
+
+            status_label.set_text("Recognizing...");
+            recognizing.set(true);
+            let receiver = voice::spawn_transcription(samples);
+            let application = application.clone();
+            let status_label = status_label.clone();
+            let recognizing = recognizing.clone();
+            let _ = glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(transcript)) => {
+                        recognizing.set(false);
+                        log_live_view(format!(
+                            "voice heard {:?} ({}, {:.1}s audio, {:.2}s to recognize, RTF {:.2})",
+                            transcript.text.trim(),
+                            transcript.language,
+                            transcript.audio_seconds,
+                            transcript.elapsed.as_secs_f32(),
+                            transcript.real_time_factor(),
+                        ));
+                        match voice::parse_command(&transcript.text) {
+                            Some(command) => {
+                                status_label.set_text(&format!(
+                                    "Heard \"{}\": {}",
+                                    transcript.text.trim(),
+                                    command.label()
+                                ));
+                                application.activate_action(command.action_name(), None);
+                            }
+                            None => status_label.set_text(&format!(
+                                "Heard \"{}\": no matching voice command.",
+                                transcript.text.trim()
+                            )),
+                        }
+                        ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        recognizing.set(false);
+                        status_label.set_text(&error);
+                        ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        recognizing.set(false);
+                        status_label.set_text("Speech recognition stopped unexpectedly.");
+                        ControlFlow::Break
+                    }
+                }
+            });
+        });
+    }
+
     let menu_bar = build_menu_bar_row();
     let toolbar = build_toolbar();
 
@@ -1384,8 +1507,130 @@ fn build_ui(
     root.append(&status_label);
 
     window.set_child(Some(&root));
+    // Set the icon when the window is realized, i.e. before it is first shown.
+    // Setting it after `present()` can leave the Windows taskbar button with the
+    // default GTK icon.
+    window.connect_realize(set_application_icon);
     window.present();
-    set_application_icon(&window);
+}
+
+/// Gives the microphone button its icon and label, and highlights it while the
+/// microphone is open so it is obvious that the next click stops listening.
+fn set_voice_button_listening(button: &Button, listening: bool) {
+    let content = GtkBox::new(Orientation::Horizontal, 6);
+    content.set_halign(Align::Center);
+    content.append(&Image::from_icon_name("audio-input-microphone-symbolic"));
+    content.append(&Label::new(Some(if listening {
+        "Stop listening"
+    } else {
+        "Voice command"
+    })));
+    button.set_child(Some(&content));
+
+    if listening {
+        button.add_css_class("destructive-action");
+    } else {
+        button.remove_css_class("destructive-action");
+    }
+}
+
+/// Downloads the voice model in the background and shows progress in the
+/// status bar. Safe to call repeatedly: it does nothing while a download is
+/// already running or once the model is installed. `on_done` is called once
+/// with the outcome when a download that this call started ends.
+fn start_voice_model_download(
+    status_label: &Label,
+    on_done: impl Fn(Result<(), String>) + 'static,
+) {
+    if voice::is_model_cached() {
+        status_label.set_text("Voice model is already installed.");
+        return;
+    }
+    if voice::is_model_downloading() {
+        status_label.set_text("Voice model is already downloading...");
+        return;
+    }
+
+    status_label.set_text("Downloading voice model...");
+    let receiver = voice::spawn_model_download();
+    let status_label = status_label.clone();
+    let _ = glib::timeout_add_local(Duration::from_millis(250), move || {
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                status_label
+                    .set_text("Voice model ready. Press the voice shortcut and say a command.");
+                on_done(Ok(()));
+                ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                status_label.set_text(&error);
+                on_done(Err(error));
+                ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                let progress = voice::download_progress();
+                if progress.total_bytes > 0 {
+                    status_label
+                        .set_text(&format!("Downloading voice model: {}", progress.label()));
+                }
+                ControlFlow::Continue
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let message = "Voice model download stopped unexpectedly.".to_owned();
+                status_label.set_text(&message);
+                on_done(Err(message));
+                ControlFlow::Break
+            }
+        }
+    });
+}
+
+/// Asks before downloading the voice model (it is a one-time download of
+/// roughly 150 MB), then starts the download.
+fn prompt_voice_model_download(parent: &ApplicationWindow, status_label: &Label) {
+    if voice::is_model_downloading() {
+        status_label.set_text("Voice model is still downloading...");
+        return;
+    }
+
+    let location = voice::model_location()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "~/.argus-capture/models".to_owned());
+
+    let dialog = Dialog::builder()
+        .title("Voice model required")
+        .transient_for(parent)
+        .modal(true)
+        .build();
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button("Download", ResponseType::Accept);
+
+    let content_area = dialog.content_area();
+    content_area.set_margin_top(12);
+    content_area.set_margin_bottom(12);
+    content_area.set_margin_start(12);
+    content_area.set_margin_end(12);
+
+    let message = Label::new(Some(&format!(
+        "Voice commands need a speech model that is not installed.\n\n\
+         It is a one-time download of about {} and will be saved to:\n{}",
+        voice::approx_download_size(),
+        location
+    )));
+    message.set_wrap(true);
+    message.set_xalign(0.0);
+    content_area.append(&message);
+
+    let status_label = status_label.clone();
+    dialog.connect_response(move |dialog, response| {
+        dialog.close();
+        if response == ResponseType::Accept {
+            start_voice_model_download(&status_label, |_| {});
+        } else {
+            status_label.set_text("Voice model not installed. Use Edit > Configuration > Voice.");
+        }
+    });
+    dialog.present();
 }
 
 fn build_menu_bar_row() -> GtkBox {
@@ -1409,6 +1654,7 @@ fn build_menu_bar_row() -> GtkBox {
     camera_menu.append(Some("Disconnect"), Some("app.camera-disconnect"));
     camera_menu.append(Some("Take Picture"), Some("app.camera-capture"));
     camera_menu.append(Some("Focus"), Some("app.camera-focus"));
+    camera_menu.append(Some("Voice Command"), Some("app.voice-listen"));
     left_root.append_submenu(Some("Camera"), &camera_menu);
 
     let menu_row = GtkBox::new(Orientation::Horizontal, 0);
@@ -1550,6 +1796,15 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
     let capture_button = Button::with_label("Take Picture");
     capture_button.set_action_name(Some("app.camera-capture"));
 
+    // Microphone button: same action as the menu item and the shortcut, so it
+    // is only clickable while the camera is connected.
+    let voice_button = Button::new();
+    voice_button.set_action_name(Some("app.voice-listen"));
+    voice_button.set_tooltip_text(Some(
+        "Click, say a command, then click again to stop listening",
+    ));
+    set_voice_button_listening(&voice_button, false);
+
     let panel_title = Label::new(Some("Focus point"));
     panel_title.set_halign(Align::Start);
     panel_title.add_css_class("heading");
@@ -1633,6 +1888,7 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
     side_panel.append(&capture_title);
     side_panel.append(&capture_mode_row);
     side_panel.append(&capture_button);
+    side_panel.append(&voice_button);
     side_panel.append(&panel_title);
     side_panel.append(&focus_operation_label);
     side_panel.append(&focus_method_label);
@@ -1656,6 +1912,7 @@ fn build_content_view(focus_overlay_state: Rc<RefCell<FocusOverlayState>>) -> Co
         live_view_picture,
         capture_mode_switch,
         capture_button,
+        voice_button,
         focus_overlay_area,
         focus_operation_label,
         focus_method_label,
@@ -1927,6 +2184,109 @@ fn present_configuration_dialog(
     shortcuts_page.append(&shortcuts_scroller);
     shortcuts_page.append(&reset_shortcuts_button);
     tabs.add_titled(&shortcuts_page, Some("shortcuts"), "Shortcuts");
+
+    // --- Voice tab ----------------------------------------------------------
+    let voice_description = Label::new(Some(&format!(
+        "Voice commands run offline using the Whisper speech model (English only). \
+         The model is a one-time download of about {}.",
+        voice::approx_download_size()
+    )));
+    voice_description.set_halign(Align::Start);
+    voice_description.set_xalign(0.0);
+    voice_description.set_wrap(true);
+
+    let voice_status_value = Label::new(None);
+    voice_status_value.set_halign(Align::Start);
+
+    let voice_location_value = Label::new(Some(
+        &voice::model_location()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Unknown (HOME is not set)".to_owned()),
+    ));
+    voice_location_value.set_halign(Align::Start);
+    voice_location_value.set_xalign(0.0);
+    voice_location_value.set_wrap(true);
+    voice_location_value.set_selectable(true);
+
+    let voice_download_button = Button::with_label("Download");
+    voice_download_button.set_halign(Align::Start);
+
+    let voice_progress = gtk::ProgressBar::new();
+    voice_progress.set_show_text(true);
+    voice_progress.set_visible(false);
+
+    let voice_message = Label::new(None);
+    voice_message.set_halign(Align::Start);
+    voice_message.set_xalign(0.0);
+    voice_message.set_wrap(true);
+    voice_message.add_css_class("dim-label");
+
+    let voice_grid = Grid::builder()
+        .column_spacing(12)
+        .row_spacing(12)
+        .hexpand(true)
+        .build();
+    attach_form_row(&voice_grid, 0, "Status", &voice_status_value);
+    attach_form_row(&voice_grid, 1, "Location", &voice_location_value);
+    attach_form_row(&voice_grid, 2, "Model", &voice_download_button);
+    voice_grid.attach(&voice_progress, 1, 3, 1, 1);
+    voice_grid.attach(&voice_message, 1, 4, 1, 1);
+
+    let voice_page = GtkBox::new(Orientation::Vertical, 12);
+    voice_page.set_margin_top(12);
+    voice_page.append(&voice_description);
+    voice_page.append(&voice_grid);
+    tabs.add_titled(&voice_page, Some("voice"), "Voice");
+
+    // Redraws the Voice tab from the real state of the model, so it is right
+    // whether the download was started here, from the voice-command prompt, or
+    // the file was deleted while this dialog was open.
+    let refresh_voice: Rc<dyn Fn()> = {
+        let status_value = voice_status_value.clone();
+        let progress_bar = voice_progress.clone();
+        let button = voice_download_button.clone();
+        Rc::new(move || {
+            if voice::is_model_downloading() {
+                let progress = voice::download_progress();
+                status_value.set_text("Downloading...");
+                progress_bar.set_visible(true);
+                progress_bar.set_fraction(progress.fraction());
+                progress_bar.set_text(Some(&progress.label()));
+                button.set_label("Downloading...");
+                button.set_sensitive(false);
+            } else if voice::is_model_cached() {
+                status_value.set_text("Installed");
+                progress_bar.set_visible(false);
+                button.set_label("Downloaded");
+                button.set_sensitive(false);
+            } else {
+                status_value.set_text("Not installed");
+                progress_bar.set_visible(false);
+                button.set_label("Download");
+                button.set_sensitive(true);
+            }
+        })
+    };
+    refresh_voice();
+
+    {
+        let status_label = status_label.clone();
+        let message = voice_message.clone();
+        let refresh = refresh_voice.clone();
+        voice_download_button.connect_clicked(move |_| {
+            message.set_text("");
+            let message = message.clone();
+            let refresh_when_done = refresh.clone();
+            start_voice_model_download(&status_label, move |result| {
+                match result {
+                    Ok(()) => message.set_text("Voice model downloaded."),
+                    Err(error) => message.set_text(&format!("Download failed: {error}")),
+                }
+                refresh_when_done();
+            });
+            refresh();
+        });
+    }
 
     // Ends a recording and puts the saved shortcuts back in force. Recording
     // suspends all application shortcuts so the key being captured cannot
@@ -2245,6 +2605,19 @@ fn present_configuration_dialog(
     });
 
     dialog.present();
+
+    // Keep the Voice tab in step with the model while the dialog is open. The
+    // timer stops by itself once the dialog is closed.
+    let dialog_weak = dialog.downgrade();
+    let _ = glib::timeout_add_local(Duration::from_millis(250), move || {
+        match dialog_weak.upgrade() {
+            Some(dialog) if dialog.is_visible() => {
+                refresh_voice();
+                ControlFlow::Continue
+            }
+            _ => ControlFlow::Break,
+        }
+    });
 }
 
 fn present_about_dialog(parent: &ApplicationWindow) {

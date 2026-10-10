@@ -226,6 +226,12 @@ pub(crate) const SHORTCUT_DEFS: &[ShortcutDef] = &[
         default: "f",
     },
     ShortcutDef {
+        action: "voice-listen",
+        menu: "Camera",
+        label: "Voice Command",
+        default: "v",
+    },
+    ShortcutDef {
         action: "edit-configuration",
         menu: "Edit",
         label: "Configuration",
@@ -525,6 +531,7 @@ mod tests {
          camera-disconnect = d\n\
          camera-capture = p\n\
          camera-focus = f\n\
+         voice-listen = v\n\
          edit-configuration = none\n\
          album-pictures = none\n\
          album-videos = none\n\

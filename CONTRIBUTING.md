@@ -59,7 +59,7 @@ dnf install git rust rust-std-static cargo rustfmt clippy
 3. Open the MSYS2 Blue terminal (not yellow or purple) and install the necessary dependencies.
 
 ```bash
-pacman -S mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libgphoto2 mingw-w64-x86_64-clang mingw-w64-x86_64-gtk4 mingw-w64-x86_64-gstreamer mingw-w64-x86_64-gst-plugins-base mingw-w64-x86_64-gst-plugins-good mingw-w64-x86_64-gst-plugins-bad mingw-w64-x86_64-gcc-libs
+pacman -S mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libgphoto2 mingw-w64-x86_64-clang mingw-w64-x86_64-gtk4 mingw-w64-x86_64-gstreamer mingw-w64-x86_64-gst-plugins-base mingw-w64-x86_64-gst-plugins-good mingw-w64-x86_64-gst-plugins-bad mingw-w64-x86_64-gcc-libs mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-gcc
 
 ```
 
@@ -69,9 +69,37 @@ pacman -S mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libgphoto2 mingw-w64-x86_
 $env:LIBCLANG_PATH = "C:\msys64\mingw64\bin"
 $env:PKG_CONFIG_PATH = "C:\msys64\mingw64\lib\pkgconfig"
 $env:PATH += ";C:\msys64\mingw64\bin"
+$env:CMAKE_GENERATOR = "Ninja"
+$env:Path = "C:\msys64\mingw64\bin;" + $env:Path
 ```
 
 5. Open a new terminal and run `cargo build` in the project directory to build the project.
+
+### Troubleshooting: whisper-rs-sys build errors on Windows
+
+The voice feature builds whisper.cpp through the `whisper-rs-sys` crate, which has two known problems with the GNU toolchain.
+
+**`c++.exe: error: /utf-8: linker input file not found`**
+The crate passes an MSVC-only flag to GCC. Set this before building:
+
+```powershell
+$env:CMAKE_CXX_FLAGS = "-ffunction-sections -fdata-sections"
+cargo clean -p whisper-rs-sys
+cargo build --release
+```
+
+**`could not find native static library ggml`**
+whisper.cpp builds its libraries without the `lib` prefix on MinGW. After the failed build, run:
+
+```powershell
+Get-ChildItem target\release\build\whisper-rs-sys-*\out\build\ggml\src\*.a |
+  Where-Object { $_.Name -notlike "lib*" } |
+  ForEach-Object { Copy-Item $_.FullName (Join-Path $_.DirectoryName ("lib" + $_.Name)) }
+
+cargo build --release
+```
+
+Run it again after any `cargo clean`.
 
 
 In order to get the necessary dependencies.

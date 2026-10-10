@@ -23,6 +23,7 @@ mod config;
 mod gui;
 mod init;
 mod network;
+mod voice;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
