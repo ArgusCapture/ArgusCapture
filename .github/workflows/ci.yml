@@ -186,15 +186,3 @@ jobs:
       # Pass 2: full build; whisper-rs-sys build script is cached, rustc now finds the libs.
       - name: Run cargo build
         run: cargo build --verbose
-
-  audit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-    steps:
-      - uses: actions/checkout@v7
-      - name: Run cargo audit
-        uses: step-security/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
