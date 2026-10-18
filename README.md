@@ -38,6 +38,7 @@ Argus Capture is named after [Argus](https://en.wikipedia.org/wiki/Argus_Panopte
 - Still photo capture
 - Video recording start/stop from the same capture control
 - Voice commands powered by Whisper: press `v` then say "capture", "focus", or "disconnect"
+- Change your Whisper model anytime in Edit > Configuration > Voice 
 - Album menu for browsing captured pictures and videos from the workspace
 - Capture result pop-up showing the saved picture/video path
 - Automatic download and optional camera-side deletion based on storage policy

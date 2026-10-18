@@ -28,6 +28,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 const SHORTCUTS_SECTION: &str = "ArgusCapture.Shortcuts";
+const VOICE_SECTION: &str = "ArgusCapture.Voice";
 const USER_CONFIG_DIR: &str = ".argus-capture";
 const CONFIG_FILE_NAME: &str = "argus-capture.conf";
 pub(crate) const DEFAULT_CONFIG_PATH: &str = "/etc/argus-capture/argus-capture.conf";
@@ -39,6 +40,7 @@ pub(crate) struct AppConfig {
     storage: StorageMode,
     shortcuts: Shortcuts,
     selected_camera: ConfiguredCamera,
+    voice_model: String,
 }
 
 impl AppConfig {
@@ -71,6 +73,11 @@ impl AppConfig {
 
     pub(crate) fn shortcuts(&self) -> &Shortcuts {
         &self.shortcuts
+    }
+
+    /// Id of the voice model chosen in the config file (`base.en` if none).
+    pub(crate) fn voice_model(&self) -> &str {
+        &self.voice_model
     }
 
     fn from_path(path: &Path) -> io::Result<Self> {
@@ -113,6 +120,10 @@ impl AppConfig {
         let username = optional_value(&ini, &camera_name, "username");
         let password = optional_value(&ini, &camera_name, "password");
         let shortcuts = Shortcuts::from_ini(&ini);
+        // A missing key is fine (old config files): fall back to the default.
+        // Unknown ids are handled later by `voice::find_model`.
+        let voice_model = optional_value(&ini, VOICE_SECTION, "model")
+            .unwrap_or_else(|| crate::voice::DEFAULT_MODEL_ID.to_owned());
 
         if username.is_some() != password.is_some() {
             return Err(io::Error::new(
@@ -129,6 +140,7 @@ impl AppConfig {
             workspace,
             storage,
             shortcuts,
+            voice_model,
             selected_camera: ConfiguredCamera {
                 name: camera_name,
                 host,
@@ -411,6 +423,7 @@ pub(crate) fn render_user_config(
     storage: StorageMode,
     camera: &ConfiguredCamera,
     shortcuts: &Shortcuts,
+    voice_model: &str,
 ) -> String {
     let mut config = format!(
         "[ArgusCapture]\n\
@@ -437,6 +450,7 @@ pub(crate) fn render_user_config(
 
     config.push('\n');
     config.push_str(&shortcuts.render_section());
+    config.push_str(&format!("\n[{VOICE_SECTION}]\nmodel = {voice_model}\n"));
     config
 }
 
@@ -465,8 +479,9 @@ pub(crate) fn write_user_config(
     storage: StorageMode,
     camera: &ConfiguredCamera,
     shortcuts: &Shortcuts,
+    voice_model: &str,
 ) -> io::Result<()> {
-    let rendered = render_user_config(workspace, storage, camera, shortcuts);
+    let rendered = render_user_config(workspace, storage, camera, shortcuts, voice_model);
 
     #[cfg(unix)]
     {
@@ -536,6 +551,9 @@ mod tests {
          album-pictures = none\n\
          album-videos = none\n\
          help-about = a\n";
+
+    const DEFAULT_VOICE_SECTION: &str = "\n[ArgusCapture.Voice]\n\
+         model = base.en\n";
 
     fn parse_config(input: &str) -> io::Result<AppConfig> {
         let mut ini = Ini::new();
@@ -674,6 +692,7 @@ mod tests {
                 password: Some("cbbaabbc".to_owned()),
             },
             &Shortcuts::default(),
+            "base.en",
         );
 
         assert_eq!(
@@ -687,7 +706,7 @@ mod tests {
                  host = 192.168.1.23\n\
                  port = 80\n\
                  username = abbc\n\
-                 password = cbbaabbc\n{DEFAULT_SHORTCUTS_SECTION}"
+                 password = cbbaabbc\n{DEFAULT_SHORTCUTS_SECTION}{DEFAULT_VOICE_SECTION}"
             )
         );
     }
@@ -705,6 +724,7 @@ mod tests {
                 password: None,
             },
             &Shortcuts::default(),
+            "base.en",
         );
 
         assert_eq!(
@@ -716,7 +736,7 @@ mod tests {
                  camera = CanonR3\n\n\
                  [CanonR3]\n\
                  host = 192.168.1.23\n\
-                 port = 80\n{DEFAULT_SHORTCUTS_SECTION}"
+                 port = 80\n{DEFAULT_SHORTCUTS_SECTION}{DEFAULT_VOICE_SECTION}"
             )
         );
     }
@@ -741,6 +761,7 @@ mod tests {
                 password: None,
             },
             &Shortcuts::default(),
+            "base.en",
         )
         .unwrap();
 
@@ -785,6 +806,32 @@ mod tests {
     }
 
     #[test]
+    fn voice_model_defaults_to_base_when_not_configured() {
+        let config = parse_config(MINIMAL_CAMERA).unwrap();
+        assert_eq!(config.voice_model(), "base.en");
+    }
+
+    #[test]
+    fn voice_model_survives_a_render_and_parse_round_trip() {
+        let rendered = render_user_config(
+            Path::new("/var/lib/argus/workspace"),
+            StorageMode::WorkspaceOnly,
+            &ConfiguredCamera {
+                name: "CanonR3".to_owned(),
+                host: "192.168.1.23".to_owned(),
+                port: 80,
+                username: None,
+                password: None,
+            },
+            &Shortcuts::default(),
+            "small.en",
+        );
+
+        assert!(rendered.contains("[ArgusCapture.Voice]\nmodel = small.en\n"));
+        assert_eq!(parse_config(&rendered).unwrap().voice_model(), "small.en");
+    }
+
+    #[test]
     fn shortcuts_survive_a_render_and_parse_round_trip() {
         let mut shortcuts = Shortcuts::default();
         shortcuts.set("quit", "<Control>q");
@@ -802,6 +849,7 @@ mod tests {
                 password: None,
             },
             &shortcuts,
+            "base.en",
         );
 
         assert_eq!(parse_config(&rendered).unwrap().shortcuts(), &shortcuts);

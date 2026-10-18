@@ -86,6 +86,7 @@ pub(crate) async fn initialize_user_config() -> InitResult<()> {
         storage,
         &configured_camera,
         &config::Shortcuts::default(),
+        crate::voice::DEFAULT_MODEL_ID,
     )?;
     println!("Created {}", config_path.display());
 

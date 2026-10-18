@@ -319,6 +319,11 @@ pub(crate) fn run(config: Option<&AppConfig>) {
     let workspace = Rc::new(RefCell::new(initial_workspace(config)));
     let storage = Rc::new(Cell::new(initial_storage(config)));
     let shortcuts = Rc::new(RefCell::new(initial_shortcuts(config)));
+    voice::select_model(
+        config
+            .map(AppConfig::voice_model)
+            .unwrap_or(voice::DEFAULT_MODEL_ID),
+    );
 
     application.connect_activate(move |application| {
         build_ui(
@@ -1534,31 +1539,34 @@ fn set_voice_button_listening(button: &Button, listening: bool) {
     }
 }
 
-/// Downloads the voice model in the background and shows progress in the
+/// Downloads a voice model in the background and shows progress in the
 /// status bar. Safe to call repeatedly: it does nothing while a download is
-/// already running or once the model is installed. `on_done` is called once
+/// already running or once that model is installed. `on_done` is called once
 /// with the outcome when a download that this call started ends.
 fn start_voice_model_download(
+    model: &'static voice::ModelInfo,
     status_label: &Label,
     on_done: impl Fn(Result<(), String>) + 'static,
 ) {
-    if voice::is_model_cached() {
-        status_label.set_text("Voice model is already installed.");
+    if model.is_installed() {
+        status_label.set_text(&format!(
+            "The {} voice model is already installed.",
+            model.label
+        ));
         return;
     }
     if voice::is_model_downloading() {
-        status_label.set_text("Voice model is already downloading...");
+        status_label.set_text("A voice model is already downloading...");
         return;
     }
 
-    status_label.set_text("Downloading voice model...");
-    let receiver = voice::spawn_model_download();
+    status_label.set_text(&format!("Downloading the {} voice model...", model.label));
+    let receiver = voice::spawn_model_download(model);
     let status_label = status_label.clone();
     let _ = glib::timeout_add_local(Duration::from_millis(250), move || {
         match receiver.try_recv() {
             Ok(Ok(())) => {
-                status_label
-                    .set_text("Voice model ready. Press the voice shortcut and say a command.");
+                status_label.set_text(&format!("The {} voice model is ready.", model.label));
                 on_done(Ok(()));
                 ControlFlow::Break
             }
@@ -1570,8 +1578,11 @@ fn start_voice_model_download(
             Err(mpsc::TryRecvError::Empty) => {
                 let progress = voice::download_progress();
                 if progress.total_bytes > 0 {
-                    status_label
-                        .set_text(&format!("Downloading voice model: {}", progress.label()));
+                    status_label.set_text(&format!(
+                        "Downloading the {} voice model: {}",
+                        model.label,
+                        progress.label()
+                    ));
                 }
                 ControlFlow::Continue
             }
@@ -1585,15 +1596,22 @@ fn start_voice_model_download(
     });
 }
 
-/// Asks before downloading the voice model (it is a one-time download of
-/// roughly 150 MB), then starts the download.
+/// Asks before downloading the selected voice model (a one-time download),
+/// then starts the download.
 fn prompt_voice_model_download(parent: &ApplicationWindow, status_label: &Label) {
     if voice::is_model_downloading() {
         status_label.set_text("Voice model is still downloading...");
         return;
     }
+    if voice::custom_model_override() {
+        // Downloading would not help: the environment variable wins.
+        status_label.set_text("ARGUS_CAPTURE_VOICE_MODEL points to a file that does not exist.");
+        return;
+    }
 
-    let location = voice::model_location()
+    let model = voice::selected_model();
+    let location = model
+        .path()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "~/.argus-capture/models".to_owned());
 
@@ -1612,9 +1630,11 @@ fn prompt_voice_model_download(parent: &ApplicationWindow, status_label: &Label)
     content_area.set_margin_end(12);
 
     let message = Label::new(Some(&format!(
-        "Voice commands need a speech model that is not installed.\n\n\
-         It is a one-time download of about {} and will be saved to:\n{}",
-        voice::approx_download_size(),
+        "Voice commands need the {} speech model, which is not installed.\n\n\
+         It is a one-time download of about {} and will be saved to:\n{}\n\n\
+         You can choose a different model in Edit > Configuration > Voice.",
+        model.label,
+        model.size_label(),
         location
     )));
     message.set_wrap(true);
@@ -1625,9 +1645,165 @@ fn prompt_voice_model_download(parent: &ApplicationWindow, status_label: &Label)
     dialog.connect_response(move |dialog, response| {
         dialog.close();
         if response == ResponseType::Accept {
-            start_voice_model_download(&status_label, |_| {});
+            start_voice_model_download(model, &status_label, |_| {});
         } else {
             status_label.set_text("Voice model not installed. Use Edit > Configuration > Voice.");
+        }
+    });
+    dialog.present();
+}
+
+/// One line of the model list in the Voice tab.
+struct VoiceModelRow {
+    model: &'static voice::ModelInfo,
+    status: Label,
+    progress: gtk::ProgressBar,
+    download_button: Button,
+    select_button: Button,
+    delete_button: Button,
+}
+
+/// Builds the widgets for one model. Which buttons are visible is decided
+/// later by `refresh_voice_rows`, from the real state on disk.
+fn build_voice_model_row(model: &'static voice::ModelInfo) -> (GtkBox, VoiceModelRow) {
+    let name = Label::new(Some(&format!("{} ({})", model.label, model.size_label())));
+    name.set_halign(Align::Start);
+    name.set_xalign(0.0);
+
+    let status = Label::new(None);
+    status.set_halign(Align::Start);
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+
+    let progress = gtk::ProgressBar::new();
+    progress.set_show_text(true);
+    progress.set_visible(false);
+
+    let text_column = GtkBox::new(Orientation::Vertical, 2);
+    text_column.set_hexpand(true);
+    text_column.append(&name);
+    text_column.append(&status);
+    text_column.append(&progress);
+
+    let download_button = Button::from_icon_name("folder-download-symbolic");
+    download_button.set_tooltip_text(Some("Download this model"));
+    let select_button = Button::from_icon_name("object-select-symbolic");
+    select_button.set_tooltip_text(Some("Use this model"));
+    let delete_button = Button::from_icon_name("user-trash-symbolic");
+    delete_button.set_tooltip_text(Some("Delete this model from disk"));
+    for button in [&download_button, &select_button, &delete_button] {
+        button.set_valign(Align::Center);
+    }
+
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_margin_top(8);
+    row.set_margin_bottom(8);
+    row.set_margin_start(12);
+    row.set_margin_end(12);
+    row.append(&text_column);
+    row.append(&download_button);
+    row.append(&select_button);
+    row.append(&delete_button);
+
+    (
+        row,
+        VoiceModelRow {
+            model,
+            status,
+            progress,
+            download_button,
+            select_button,
+            delete_button,
+        },
+    )
+}
+
+/// Redraws every row from the real state: what is installed, what is
+/// downloading, and which model is currently picked in the dialog.
+///
+///   not installed  -> [Download]
+///   installed      -> [Select] [Delete]   (Select is disabled for the one in use)
+///   downloading    -> progress bar only
+fn refresh_voice_rows(rows: &[VoiceModelRow], selected_id: &str) {
+    let downloading = voice::downloading_model();
+    let progress = voice::download_progress();
+    let overridden = voice::custom_model_override();
+
+    for row in rows {
+        let installed = row.model.is_installed();
+        let is_downloading = downloading == Some(row.model.id);
+        let is_selected = row.model.id == selected_id;
+
+        row.progress.set_visible(is_downloading);
+        if is_downloading {
+            row.progress.set_fraction(progress.fraction());
+            row.progress.set_text(Some(&progress.label()));
+        }
+
+        let state = if is_downloading {
+            "Downloading..."
+        } else if installed && is_selected {
+            "In use"
+        } else if installed {
+            "Installed"
+        } else if is_selected {
+            "Selected, but not installed"
+        } else {
+            "Not installed"
+        };
+        row.status
+            .set_text(&format!("{} - {}", row.model.note, state));
+
+        row.download_button
+            .set_visible(!installed && !is_downloading);
+        // Only one download at a time.
+        row.download_button.set_sensitive(downloading.is_none());
+
+        row.select_button.set_visible(installed && !is_downloading);
+        row.select_button.set_sensitive(!is_selected && !overridden);
+        if is_selected {
+            row.select_button.add_css_class("suggested-action");
+        } else {
+            row.select_button.remove_css_class("suggested-action");
+        }
+
+        row.delete_button.set_visible(installed && !is_downloading);
+    }
+}
+
+/// Asks before deleting a model file, then calls `on_confirm`.
+fn confirm_voice_model_delete(
+    parent: &Dialog,
+    model: &'static voice::ModelInfo,
+    on_confirm: impl Fn() + 'static,
+) {
+    let dialog = Dialog::builder()
+        .title("Delete voice model")
+        .transient_for(parent)
+        .modal(true)
+        .build();
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button("Delete", ResponseType::Accept);
+
+    let content_area = dialog.content_area();
+    content_area.set_margin_top(12);
+    content_area.set_margin_bottom(12);
+    content_area.set_margin_start(12);
+    content_area.set_margin_end(12);
+
+    let message = Label::new(Some(&format!(
+        "Delete the {} model ({}) from disk?\n\nYou can download it again later.",
+        model.label,
+        model.size_label()
+    )));
+    message.set_wrap(true);
+    message.set_xalign(0.0);
+    content_area.append(&message);
+
+    dialog.connect_response(move |dialog, response| {
+        dialog.close();
+        if response == ResponseType::Accept {
+            on_confirm();
         }
     });
     dialog.present();
@@ -2186,34 +2362,51 @@ fn present_configuration_dialog(
     tabs.add_titled(&shortcuts_page, Some("shortcuts"), "Shortcuts");
 
     // --- Voice tab ----------------------------------------------------------
-    let voice_description = Label::new(Some(&format!(
-        "Voice commands run offline using the Whisper speech model (English only). \
-         The model is a one-time download of about {}.",
-        voice::approx_download_size()
-    )));
+    // The model picked in this dialog. It only becomes the real choice (and is
+    // written to the config file) when the user presses Save, exactly like the
+    // shortcuts. Downloading and deleting, being file operations, happen at once.
+    let pending_voice_model = Rc::new(RefCell::new(voice::selected_model().id.to_owned()));
+
+    let voice_description = Label::new(Some(
+        "Voice commands run offline using a Whisper speech model (English only). \
+         Download the models you want, then choose which one to use. \
+         Larger models understand better but take longer to respond.",
+    ));
     voice_description.set_halign(Align::Start);
     voice_description.set_xalign(0.0);
     voice_description.set_wrap(true);
 
-    let voice_status_value = Label::new(None);
-    voice_status_value.set_halign(Align::Start);
-
-    let voice_location_value = Label::new(Some(
-        &voice::model_location()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "Unknown (HOME is not set)".to_owned()),
+    let voice_override_note = Label::new(Some(
+        "ARGUS_CAPTURE_VOICE_MODEL is set, so that file is used no matter \
+         which model is selected here.",
     ));
+    voice_override_note.set_halign(Align::Start);
+    voice_override_note.set_xalign(0.0);
+    voice_override_note.set_wrap(true);
+    voice_override_note.add_css_class("dim-label");
+
+    let voice_list = ListBox::new();
+    voice_list.set_selection_mode(gtk::SelectionMode::None);
+    voice_list.add_css_class("frame");
+
+    let mut voice_row_list = Vec::new();
+    for model in voice::MODELS {
+        let (row_widget, row) = build_voice_model_row(model);
+        voice_list.append(&row_widget);
+        voice_row_list.push(row);
+    }
+    let voice_rows = Rc::new(voice_row_list);
+
+    let voice_location_value = Label::new(Some(&format!(
+        "Stored in: {}",
+        voice::model_cache_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Unknown (HOME is not set)".to_owned())
+    )));
     voice_location_value.set_halign(Align::Start);
     voice_location_value.set_xalign(0.0);
     voice_location_value.set_wrap(true);
     voice_location_value.set_selectable(true);
-
-    let voice_download_button = Button::with_label("Download");
-    voice_download_button.set_halign(Align::Start);
-
-    let voice_progress = gtk::ProgressBar::new();
-    voice_progress.set_show_text(true);
-    voice_progress.set_visible(false);
 
     let voice_message = Label::new(None);
     voice_message.set_halign(Align::Start);
@@ -2221,71 +2414,84 @@ fn present_configuration_dialog(
     voice_message.set_wrap(true);
     voice_message.add_css_class("dim-label");
 
-    let voice_grid = Grid::builder()
-        .column_spacing(12)
-        .row_spacing(12)
-        .hexpand(true)
-        .build();
-    attach_form_row(&voice_grid, 0, "Status", &voice_status_value);
-    attach_form_row(&voice_grid, 1, "Location", &voice_location_value);
-    attach_form_row(&voice_grid, 2, "Model", &voice_download_button);
-    voice_grid.attach(&voice_progress, 1, 3, 1, 1);
-    voice_grid.attach(&voice_message, 1, 4, 1, 1);
-
     let voice_page = GtkBox::new(Orientation::Vertical, 12);
     voice_page.set_margin_top(12);
     voice_page.append(&voice_description);
-    voice_page.append(&voice_grid);
+    if voice::custom_model_override() {
+        voice_page.append(&voice_override_note);
+    }
+    voice_page.append(&voice_list);
+    voice_page.append(&voice_location_value);
+    voice_page.append(&voice_message);
     tabs.add_titled(&voice_page, Some("voice"), "Voice");
 
-    // Redraws the Voice tab from the real state of the model, so it is right
-    // whether the download was started here, from the voice-command prompt, or
-    // the file was deleted while this dialog was open.
+    // Redraws the list from the real state, so it is right whether a download
+    // was started here, from the voice-command prompt, or a file was deleted
+    // while this dialog was open. The timer at the end of this function calls it.
     let refresh_voice: Rc<dyn Fn()> = {
-        let status_value = voice_status_value.clone();
-        let progress_bar = voice_progress.clone();
-        let button = voice_download_button.clone();
-        Rc::new(move || {
-            if voice::is_model_downloading() {
-                let progress = voice::download_progress();
-                status_value.set_text("Downloading...");
-                progress_bar.set_visible(true);
-                progress_bar.set_fraction(progress.fraction());
-                progress_bar.set_text(Some(&progress.label()));
-                button.set_label("Downloading...");
-                button.set_sensitive(false);
-            } else if voice::is_model_cached() {
-                status_value.set_text("Installed");
-                progress_bar.set_visible(false);
-                button.set_label("Downloaded");
-                button.set_sensitive(false);
-            } else {
-                status_value.set_text("Not installed");
-                progress_bar.set_visible(false);
-                button.set_label("Download");
-                button.set_sensitive(true);
-            }
-        })
+        let rows = voice_rows.clone();
+        let pending = pending_voice_model.clone();
+        Rc::new(move || refresh_voice_rows(&rows, &pending.borrow()))
     };
     refresh_voice();
 
-    {
-        let status_label = status_label.clone();
-        let message = voice_message.clone();
-        let refresh = refresh_voice.clone();
-        voice_download_button.connect_clicked(move |_| {
-            message.set_text("");
-            let message = message.clone();
-            let refresh_when_done = refresh.clone();
-            start_voice_model_download(&status_label, move |result| {
-                match result {
-                    Ok(()) => message.set_text("Voice model downloaded."),
-                    Err(error) => message.set_text(&format!("Download failed: {error}")),
-                }
-                refresh_when_done();
+    // Wire the three buttons of every row.
+    for row in voice_rows.iter() {
+        let model = row.model;
+
+        // Download.
+        {
+            let status_label = status_label.clone();
+            let message = voice_message.clone();
+            let refresh = refresh_voice.clone();
+            row.download_button.connect_clicked(move |_| {
+                message.set_text("");
+                let message = message.clone();
+                let refresh_when_done = refresh.clone();
+                start_voice_model_download(model, &status_label, move |result| {
+                    match result {
+                        Ok(()) => message.set_text(&format!("{} model downloaded.", model.label)),
+                        Err(error) => message.set_text(&format!("Download failed: {error}")),
+                    }
+                    refresh_when_done();
+                });
+                refresh();
             });
-            refresh();
-        });
+        }
+
+        // Select: only changes the pending choice; Save makes it real.
+        {
+            let pending = pending_voice_model.clone();
+            let message = voice_message.clone();
+            let refresh = refresh_voice.clone();
+            row.select_button.connect_clicked(move |_| {
+                *pending.borrow_mut() = model.id.to_owned();
+                message.set_text(&format!("{} selected. Press Save to apply.", model.label));
+                refresh();
+            });
+        }
+
+        // Delete: confirm first. A weak reference avoids a reference cycle
+        // between the dialog and the button handler it contains.
+        {
+            let dialog_weak = dialog.downgrade();
+            let message = voice_message.clone();
+            let refresh = refresh_voice.clone();
+            row.delete_button.connect_clicked(move |_| {
+                let Some(parent) = dialog_weak.upgrade() else {
+                    return;
+                };
+                let message = message.clone();
+                let refresh = refresh.clone();
+                confirm_voice_model_delete(&parent, model, move || {
+                    match voice::delete_model(model) {
+                        Ok(()) => message.set_text(&format!("{} model deleted.", model.label)),
+                        Err(error) => message.set_text(&error),
+                    }
+                    refresh();
+                });
+            });
+        }
     }
 
     // Ends a recording and puts the saved shortcuts back in force. Recording
@@ -2530,6 +2736,7 @@ fn present_configuration_dialog(
     let status_label = status_label.clone();
     let tabs_for_response = tabs.clone();
     let shortcut_hint_for_response = shortcut_hint.clone();
+    let pending_voice_model_for_response = pending_voice_model.clone();
     dialog.connect_response(move |dialog, response| {
         if response != ResponseType::Accept {
             // Make sure shortcuts suspended by an unfinished recording come back.
@@ -2574,6 +2781,7 @@ fn present_configuration_dialog(
         let workspace = PathBuf::from(workspace_text);
         let storage = storage_mode_from_index(storage_dropdown.selected());
         let new_shortcuts = pending_shortcuts.borrow().clone();
+        let new_voice_model = pending_voice_model_for_response.borrow().clone();
 
         if let Some((first, second)) = new_shortcuts.conflict() {
             let message = format!(
@@ -2588,8 +2796,15 @@ fn present_configuration_dialog(
             return;
         }
 
-        match save_configuration(&workspace, storage, &camera, &new_shortcuts) {
+        match save_configuration(
+            &workspace,
+            storage,
+            &camera,
+            &new_shortcuts,
+            &new_voice_model,
+        ) {
             Ok(()) => {
+                voice::select_model(&new_voice_model);
                 *workspace_state.borrow_mut() = workspace;
                 storage_state.set(storage);
                 *configured_camera_state.borrow_mut() = camera;
@@ -3115,12 +3330,13 @@ fn save_configuration(
     storage: StorageMode,
     camera: &ConfiguredCamera,
     shortcuts: &Shortcuts,
+    voice_model: &str,
 ) -> io::Result<()> {
     let path = config::user_config_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    config::write_user_config(&path, workspace, storage, camera, shortcuts)
+    config::write_user_config(&path, workspace, storage, camera, shortcuts, voice_model)
 }
 
 fn initial_shortcuts(config: Option<&AppConfig>) -> Shortcuts {

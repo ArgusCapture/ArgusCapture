@@ -18,9 +18,9 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,17 +45,105 @@ const SILENCE_RMS_THRESHOLD: f32 = 0.005;
 /// Segments Whisper itself considers "probably not speech" are dropped.
 const NO_SPEECH_THRESHOLD: f32 = 0.6;
 
-/// English-only "base" model (ggml format) from the whisper.cpp project.
-const MODEL_FILE: &str = "ggml-base.en.bin";
-const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
-/// Used for the progress bar until the server tells us the real size.
-const APPROX_DOWNLOAD_BYTES: u64 = 148_000_000;
+/// Every model is downloaded from the whisper.cpp project on Hugging Face.
+const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+/// Used when the config names no model, or one we do not know.
+pub(crate) const DEFAULT_MODEL_ID: &str = "base.en";
 
 /// Optional: path to your own ggml Whisper model file. Skips the download.
 const MODEL_ENV: &str = "ARGUS_CAPTURE_VOICE_MODEL";
 /// Optional: folder for the downloaded model (default `~/.argus-capture/models`).
 const CACHE_ENV: &str = "ARGUS_CAPTURE_VOICE_CACHE";
+
+/// One speech model the user can pick. To support another model, add a row
+/// to `MODELS`; nothing else needs to change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ModelInfo {
+    /// Stable name stored in the config file, for example `base.en`.
+    pub(crate) id: &'static str,
+    /// Short name shown in the Voice tab.
+    pub(crate) label: &'static str,
+    /// File name inside the model folder.
+    pub(crate) file: &'static str,
+    /// Used for the progress bar until the server tells us the real size.
+    pub(crate) approx_bytes: u64,
+    /// One-line hint shown under the name.
+    pub(crate) note: &'static str,
+}
+
+/// All supported models. They are English-only (`.en`) because recognition is
+/// fixed to English and `parse_command` only knows English words.
+pub(crate) const MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "tiny.en",
+        label: "Tiny",
+        file: "ggml-tiny.en.bin",
+        approx_bytes: 78_000_000,
+        note: "Fastest, least accurate",
+    },
+    ModelInfo {
+        id: "base.en",
+        label: "Base",
+        file: "ggml-base.en.bin",
+        approx_bytes: 148_000_000,
+        note: "Recommended",
+    },
+    ModelInfo {
+        id: "small.en",
+        label: "Small",
+        file: "ggml-small.en.bin",
+        approx_bytes: 488_000_000,
+        note: "More accurate, slower",
+    },
+];
+
+impl ModelInfo {
+    fn url(&self) -> String {
+        format!("{MODEL_BASE_URL}/{}", self.file)
+    }
+
+    /// Full path of this model's file, or `None` when HOME is not set.
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        model_cache_dir().map(|cache| cache.join(self.file))
+    }
+
+    pub(crate) fn is_installed(&self) -> bool {
+        self.path().map(|path| path.is_file()).unwrap_or(false)
+    }
+
+    /// For example `148 MB`.
+    pub(crate) fn size_label(&self) -> String {
+        format_bytes(self.approx_bytes)
+    }
+}
+
+/// Looks a model up by id. Unknown ids (a typo in the config file, or a model
+/// removed in a later version) fall back to the default instead of failing.
+pub(crate) fn find_model(id: &str) -> &'static ModelInfo {
+    MODELS
+        .iter()
+        .find(|model| model.id == id)
+        .or_else(|| MODELS.iter().find(|model| model.id == DEFAULT_MODEL_ID))
+        .unwrap_or(&MODELS[0])
+}
+
+// The model voice commands use. Set from the config file at startup and
+// again when the user saves the Configuration dialog.
+static SELECTED_MODEL: Mutex<&'static str> = Mutex::new(DEFAULT_MODEL_ID);
+
+pub(crate) fn select_model(id: &str) {
+    if let Ok(mut selected) = SELECTED_MODEL.lock() {
+        *selected = find_model(id).id;
+    }
+}
+
+pub(crate) fn selected_model() -> &'static ModelInfo {
+    let id = SELECTED_MODEL
+        .lock()
+        .map(|id| *id)
+        .unwrap_or(DEFAULT_MODEL_ID);
+    find_model(id)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum VoiceCommand {
@@ -131,13 +219,19 @@ pub(crate) fn model_cache_dir() -> Option<PathBuf> {
 }
 
 /// The model file to load: `$ARGUS_CAPTURE_VOICE_MODEL` if set, otherwise
-/// `<cache>/ggml-base.en.bin`.
+/// the file of the selected model in the cache folder.
 fn model_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os(MODEL_ENV) {
         return Some(PathBuf::from(path));
     }
 
-    model_cache_dir().map(|cache| cache.join(MODEL_FILE))
+    selected_model().path()
+}
+
+/// True when the user pointed `ARGUS_CAPTURE_VOICE_MODEL` at their own file.
+/// That file then overrides whatever model is selected.
+pub(crate) fn custom_model_override() -> bool {
+    env::var_os(MODEL_ENV).is_some()
 }
 
 /// True once the model file exists. The downloader writes to a `.part` file
@@ -147,21 +241,11 @@ pub(crate) fn is_model_cached() -> bool {
     model_path().map(|path| path.is_file()).unwrap_or(false)
 }
 
-/// True when voice commands can run right now: the model file is on disk, or
-/// it was already loaded into memory earlier in this session (deleting the
-/// file afterwards does not affect an already loaded model).
+/// True when voice commands can run right now: the selected model's file is
+/// on disk. (Deleting a model also unloads it, so there is no "loaded but
+/// file gone" case any more.)
 pub(crate) fn is_voice_ready() -> bool {
-    RECOGNIZER.get().is_some() || is_model_cached()
-}
-
-/// Where the model is (or will be) stored, for showing to the user.
-pub(crate) fn model_location() -> Option<PathBuf> {
-    model_path()
-}
-
-/// Rough download size for prompts, for example `148 MB`.
-pub(crate) fn approx_download_size() -> String {
-    format_bytes(APPROX_DOWNLOAD_BYTES)
+    is_model_cached()
 }
 
 // Progress of the current download, shared between the worker thread (writes)
@@ -213,30 +297,40 @@ pub(crate) fn download_progress() -> DownloadProgress {
     DownloadProgress {
         downloaded_bytes: DOWNLOADED_BYTES.load(Ordering::Relaxed),
         total_bytes: TOTAL_BYTES.load(Ordering::Relaxed),
-        complete: is_model_cached(),
+        complete: !is_model_downloading(),
     }
 }
 
-static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+/// Id of the model being downloaded right now, if any. Only one download runs
+/// at a time, so the Voice tab can disable the other Download buttons.
+static DOWNLOADING_MODEL: Mutex<Option<&'static str>> = Mutex::new(None);
+
+pub(crate) fn downloading_model() -> Option<&'static str> {
+    DOWNLOADING_MODEL.lock().ok().and_then(|current| *current)
+}
 
 pub(crate) fn is_model_downloading() -> bool {
-    DOWNLOADING.load(Ordering::Acquire)
+    downloading_model().is_some()
 }
 
 struct DownloadGuard;
 
 impl DownloadGuard {
-    fn acquire() -> Option<Self> {
-        DOWNLOADING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
+    fn acquire(id: &'static str) -> Option<Self> {
+        let mut current = DOWNLOADING_MODEL.lock().ok()?;
+        if current.is_some() {
+            return None;
+        }
+        *current = Some(id);
+        Some(Self)
     }
 }
 
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
-        DOWNLOADING.store(false, Ordering::Release);
+        if let Ok(mut current) = DOWNLOADING_MODEL.lock() {
+            *current = None;
+        }
     }
 }
 
@@ -244,66 +338,87 @@ impl Drop for DownloadGuard {
 /// model is ever downloaded, so it always happens because the user asked for
 /// it. Poll the receiver from the main thread with `glib::timeout_add_local`
 /// and read `download_progress()` meanwhile.
-pub(crate) fn spawn_model_download() -> mpsc::Receiver<Result<(), String>> {
+pub(crate) fn spawn_model_download(
+    model: &'static ModelInfo,
+) -> mpsc::Receiver<Result<(), String>> {
     let (sender, receiver) = mpsc::channel();
 
-    let Some(guard) = DownloadGuard::acquire() else {
-        let _ = sender.send(Err("The voice model is already downloading.".to_owned()));
+    let Some(guard) = DownloadGuard::acquire(model.id) else {
+        let _ = sender.send(Err("A voice model is already downloading.".to_owned()));
         return receiver;
     };
 
     // Reset here, not in the worker, so the first progress poll cannot show
     // numbers left over from an earlier download.
     DOWNLOADED_BYTES.store(0, Ordering::Relaxed);
-    TOTAL_BYTES.store(APPROX_DOWNLOAD_BYTES, Ordering::Relaxed);
+    TOTAL_BYTES.store(model.approx_bytes, Ordering::Relaxed);
 
     thread::spawn(move || {
         let _guard = guard;
-        let result = match model_path() {
-            Some(path) => ensure_model(&path),
-            None => Err("HOME is not set; cannot locate the voice model folder".to_owned()),
-        };
+        let result = ensure_model(model);
         let _ = sender.send(result);
     });
     receiver
 }
 
-fn ensure_model(path: &Path) -> Result<(), String> {
+/// Deletes a downloaded model from disk. Refuses while that model is being
+/// downloaded. The model is unloaded from memory first, because Windows will
+/// not delete a file that is still in use.
+pub(crate) fn delete_model(model: &ModelInfo) -> Result<(), String> {
+    if downloading_model() == Some(model.id) {
+        return Err("Wait for the download to finish first.".to_owned());
+    }
+
+    let path = model
+        .path()
+        .ok_or_else(|| "HOME is not set; cannot locate the voice model folder".to_owned())?;
+
+    unload_model(&path);
+    // Also clean up a leftover half-finished download, if there is one.
+    let _ = fs::remove_file(path.with_file_name(format!("{}.part", model.file)));
+    remove_model_file(&path)
+}
+
+/// Removes a file; a file that is already gone counts as success.
+fn remove_model_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not delete {}: {error}", path.display())),
+    }
+}
+
+fn ensure_model(model: &ModelInfo) -> Result<(), String> {
+    let path = model
+        .path()
+        .ok_or_else(|| "HOME is not set; cannot locate the voice model folder".to_owned())?;
+
     if path.is_file() {
         return Ok(());
     }
 
-    // A custom model path is the user's own file; never overwrite it with a
-    // download.
-    if env::var_os(MODEL_ENV).is_some() {
-        return Err(format!(
-            "{MODEL_ENV} points to {}, which does not exist.",
-            path.display()
-        ));
-    }
-
-    download_model(path)
+    download_model(model, &path)
 }
 
 /// Downloads the model to `path`, updating the progress counters.
 ///
 /// Data goes to `<file>.part` first and is renamed on success, so a crash or
 /// lost connection never leaves a half-written model that looks complete.
-fn download_model(path: &Path) -> Result<(), String> {
+fn download_model(model: &ModelInfo, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
     }
 
     DOWNLOADED_BYTES.store(0, Ordering::Relaxed);
-    TOTAL_BYTES.store(APPROX_DOWNLOAD_BYTES, Ordering::Relaxed);
+    TOTAL_BYTES.store(model.approx_bytes, Ordering::Relaxed);
 
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(60))
         .build();
     let response = agent
-        .get(MODEL_URL)
+        .get(&model.url())
         .call()
         .map_err(|error| format!("Could not download the voice model: {error}"))?;
 
@@ -314,7 +429,7 @@ fn download_model(path: &Path) -> Result<(), String> {
         TOTAL_BYTES.store(total, Ordering::Relaxed);
     }
 
-    let partial_path = path.with_file_name(format!("{MODEL_FILE}.part"));
+    let partial_path = path.with_file_name(format!("{}.part", model.file));
     let result = copy_with_progress(response.into_reader(), &partial_path, expected_bytes);
     if let Err(error) = result {
         let _ = fs::remove_file(&partial_path);
@@ -389,10 +504,7 @@ struct Recognizer {
 }
 
 impl Recognizer {
-    fn load() -> Result<Self, String> {
-        let path = model_path()
-            .ok_or_else(|| "HOME is not set; cannot locate the voice model folder".to_owned())?;
-
+    fn load(path: &Path) -> Result<Self, String> {
         if !path.is_file() {
             return Err(format!(
                 "Voice model not found at {}. Use Edit > Configuration > Voice.",
@@ -402,7 +514,7 @@ impl Recognizer {
 
         // CPU by default. GPU backends are enabled at build time (see the
         // whisper-rs features), and `use_gpu` then defaults to true.
-        let context = WhisperContext::new_with_params(&path, WhisperContextParameters::default())
+        let context = WhisperContext::new_with_params(path, WhisperContextParameters::default())
             .map_err(|error| format!("Failed to load the voice model: {error}"))?;
         let state = context
             .create_state()
@@ -470,19 +582,48 @@ fn pad_to_minimum_length(samples: &[f32]) -> Vec<f32> {
     padded
 }
 
-// Loading is slow, so it happens lazily on the worker thread. Only a
-// successful load is kept, so a failed download (for example, no internet)
-// can be retried without restarting the app.
-static RECOGNIZER: OnceLock<Recognizer> = OnceLock::new();
+// Loading is slow, so it happens lazily on the worker thread. The slot
+// remembers which file is loaded: if the selected model changes, the next
+// recognition loads the new one. Only successful loads are kept, so a
+// failure can be retried without restarting the app.
+static RECOGNIZER: Mutex<Option<(PathBuf, Arc<Recognizer>)>> = Mutex::new(None);
+
+fn recognizer_for(path: &Path) -> Result<Arc<Recognizer>, String> {
+    {
+        let slot = RECOGNIZER
+            .lock()
+            .map_err(|_| "Speech recognizer is unavailable.".to_owned())?;
+        if let Some((loaded_path, recognizer)) = slot.as_ref()
+            && loaded_path == path
+        {
+            return Ok(Arc::clone(recognizer));
+        }
+    } // The lock is released here, before the slow load below.
+
+    let recognizer = Arc::new(Recognizer::load(path)?);
+    let mut slot = RECOGNIZER
+        .lock()
+        .map_err(|_| "Speech recognizer is unavailable.".to_owned())?;
+    *slot = Some((path.to_path_buf(), Arc::clone(&recognizer)));
+    Ok(recognizer)
+}
+
+/// Forgets the loaded model if it is this file. A recognition already running
+/// keeps its own `Arc` and finishes normally.
+fn unload_model(path: &Path) {
+    if let Ok(mut slot) = RECOGNIZER.lock()
+        && slot
+            .as_ref()
+            .is_some_and(|(loaded_path, _)| loaded_path == path)
+    {
+        *slot = None;
+    }
+}
 
 fn transcribe_blocking(samples: &[f32]) -> Result<Transcript, String> {
-    let recognizer = match RECOGNIZER.get() {
-        Some(recognizer) => recognizer,
-        None => {
-            let loaded = Recognizer::load()?;
-            RECOGNIZER.get_or_init(|| loaded)
-        }
-    };
+    let path = model_path()
+        .ok_or_else(|| "HOME is not set; cannot locate the voice model folder".to_owned())?;
+    let recognizer = recognizer_for(&path)?;
 
     let started = Instant::now();
     let text = recognizer.transcribe(samples)?;
@@ -766,14 +907,15 @@ mod tests {
 
     #[test]
     fn only_one_download_can_run_at_a_time() {
-        let first = DownloadGuard::acquire();
+        let first = DownloadGuard::acquire("base.en");
         assert!(first.is_some());
         assert!(is_model_downloading());
-        assert!(DownloadGuard::acquire().is_none());
+        assert_eq!(downloading_model(), Some("base.en"));
+        assert!(DownloadGuard::acquire("tiny.en").is_none());
 
         drop(first);
         assert!(!is_model_downloading());
-        assert!(DownloadGuard::acquire().is_some());
+        assert!(DownloadGuard::acquire("tiny.en").is_some());
     }
 
     #[test]
@@ -785,5 +927,47 @@ mod tests {
             elapsed: Duration::from_secs(2),
         };
         assert!((transcript.real_time_factor() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unknown_model_ids_fall_back_to_the_default() {
+        assert_eq!(find_model("tiny.en").id, "tiny.en");
+        assert_eq!(find_model("does-not-exist").id, DEFAULT_MODEL_ID);
+    }
+
+    #[test]
+    fn model_catalog_is_consistent() {
+        assert!(MODELS.iter().any(|model| model.id == DEFAULT_MODEL_ID));
+        for (index, model) in MODELS.iter().enumerate() {
+            assert!(model.file.starts_with("ggml-") && model.file.ends_with(".bin"));
+            // English-only for now: recognition and keywords are English.
+            assert!(model.id.ends_with(".en"));
+            for other in &MODELS[index + 1..] {
+                assert_ne!(model.id, other.id);
+                assert_ne!(model.file, other.file);
+            }
+        }
+    }
+
+    #[test]
+    fn selecting_a_model_changes_the_selected_model() {
+        select_model("small.en");
+        assert_eq!(selected_model().id, "small.en");
+        select_model("garbage");
+        assert_eq!(selected_model().id, DEFAULT_MODEL_ID);
+    }
+
+    #[test]
+    fn removing_a_model_file_is_idempotent() {
+        let directory = env::temp_dir().join(format!("argus-voice-delete-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("ggml-test.bin");
+        fs::write(&file, b"x").unwrap();
+
+        assert!(remove_model_file(&file).is_ok());
+        assert!(!file.exists());
+        assert!(remove_model_file(&file).is_ok()); // already gone is fine
+
+        let _ = fs::remove_dir_all(&directory);
     }
 }
